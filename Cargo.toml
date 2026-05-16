@@ -1,0 +1,32 @@
+[package]
+name = "updatable-cli"
+description = "Reusable self-update + MCP self-update tool for Rust CLIs that ship via GitHub releases"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+readme = "README.md"
+repository = "https://github.com/harryaskham/updatable-cli"
+homepage = "https://github.com/harryaskham/updatable-cli"
+keywords = ["cli", "self-update", "github", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "1", features = ["derive"] }
+mcp-cli = { git = "https://github.com/harryaskham/mcp-cli", branch = "main" }
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+sha2 = "0.10"
+hex = "0.4"
+semver = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
