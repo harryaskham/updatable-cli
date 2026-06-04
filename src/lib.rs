@@ -674,4 +674,81 @@ mod tests {
         // A second promotion with nothing staged is a clean no-op.
         assert!(updater.promote_next().unwrap().is_none());
     }
+
+    /// Minimal single-shot HTTP server for offline `check_latest` tests.
+    ///
+    /// Binds an ephemeral localhost port, serves exactly one canned `200 OK`
+    /// response body, then returns. No network egress and no extra
+    /// dependencies — keeps the merge-queue smoke contract intact.
+    fn spawn_one_shot_http(body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request headers so the client write completes.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn check_latest_parses_release_and_flags_newer_version() {
+        let body = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "https://example.invalid/releases/v9.9.9",
+            "assets": [
+                {"name": "toolx-9.9.9-x86_64-linux.tar.gz"},
+                {"name": "toolx-9.9.9-x86_64-linux.sha256"}
+            ]
+        }"#
+        .to_string();
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config).check_latest().expect("check_latest succeeds");
+        handle.join().unwrap();
+        assert_eq!(info.tag, "v9.9.9");
+        assert_eq!(info.version, "9.9.9");
+        assert_eq!(
+            info.html_url.as_deref(),
+            Some("https://example.invalid/releases/v9.9.9")
+        );
+        assert_eq!(
+            info.assets,
+            vec![
+                "toolx-9.9.9-x86_64-linux.tar.gz".to_string(),
+                "toolx-9.9.9-x86_64-linux.sha256".to_string(),
+            ]
+        );
+        assert!(info.newer_than_current, "9.9.9 should be newer than 0.1.0");
+    }
+
+    #[test]
+    fn check_latest_reports_not_newer_for_same_version() {
+        let body = r#"{"tag_name": "v0.1.0", "assets": []}"#.to_string();
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config).check_latest().expect("check_latest succeeds");
+        handle.join().unwrap();
+        assert_eq!(info.version, "0.1.0");
+        assert!(info.assets.is_empty());
+        assert!(info.html_url.is_none());
+        assert!(
+            !info.newer_than_current,
+            "identical version must not be flagged as newer"
+        );
+    }
 }
