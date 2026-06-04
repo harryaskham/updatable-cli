@@ -399,8 +399,8 @@ fn download_bytes(agent: &ureq::Agent, url: &str, user_agent: &str) -> Result<Ve
 }
 
 fn download_text(agent: &ureq::Agent, url: &str, user_agent: &str) -> Result<String> {
-    Ok(String::from_utf8(download_bytes(agent, url, user_agent)?)
-        .map_err(|err| anyhow!("checksum was not UTF-8: {err}"))?)
+    String::from_utf8(download_bytes(agent, url, user_agent)?)
+        .map_err(|err| anyhow!("checksum was not UTF-8: {err}"))
 }
 
 fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<()> {
@@ -630,5 +630,48 @@ mod tests {
         assert!(status.next_path.ends_with("toolx_next"));
         assert!(!status.installed_exists);
         assert!(!status.next_staged);
+    }
+
+    #[test]
+    fn promote_next_is_noop_when_nothing_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        // No `<tool>_next` staged yet: promotion must report that nothing happened
+        // and must not create the installed binary.
+        let promoted = updater.promote_next().unwrap();
+        assert!(promoted.is_none(), "expected no promotion when nothing staged");
+        assert!(!updater.config().installed_binary_path().unwrap().exists());
+    }
+
+    #[test]
+    fn promote_next_moves_staged_binary_and_marks_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+
+        // Stage a fake `<tool>_next` payload, deliberately non-executable so the
+        // promotion is responsible for chmod 0755.
+        let next_path = updater.config().next_binary_path().unwrap();
+        fs::create_dir_all(next_path.parent().unwrap()).unwrap();
+        fs::write(&next_path, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&next_path).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&next_path, perms).unwrap();
+
+        let installed = updater.promote_next().unwrap().expect("promotion to occur");
+        let expected = updater.config().installed_binary_path().unwrap();
+        assert_eq!(installed, expected);
+        // Staged path consumed, installed path created and executable.
+        assert!(!next_path.exists(), "staged binary should be renamed away");
+        assert!(expected.exists(), "installed binary should exist after promotion");
+        let mode = fs::metadata(&expected).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "installed binary should be chmod 0755");
+        assert_eq!(fs::read(&expected).unwrap(), b"#!/bin/sh\nexit 0\n");
+
+        // A second promotion with nothing staged is a clean no-op.
+        assert!(updater.promote_next().unwrap().is_none());
     }
 }
