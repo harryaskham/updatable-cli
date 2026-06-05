@@ -44,6 +44,10 @@ pub struct UpdaterConfig {
     pub install_dir: Option<PathBuf>,
     /// Optional override for the GitHub API base. Defaults to `https://api.github.com`.
     pub api_base: Option<String>,
+    /// Optional override for the release **download** host base. Defaults to
+    /// `https://github.com`. Set this for GitHub Enterprise, a release mirror, or an
+    /// offline/air-gapped host that serves `<base>/<repo>/releases/download/<tag>/<asset>`.
+    pub download_base: Option<String>,
     /// Optional User-Agent header. Defaults to `<tool>-updater/<current_version>`.
     pub user_agent: Option<String>,
     /// Optional GitHub token for higher rate limits / private repos.
@@ -77,6 +81,7 @@ impl UpdaterConfig {
             asset_strategy: AssetStrategy::default(),
             install_dir: None,
             api_base: None,
+            download_base: None,
             user_agent: None,
             github_token: None,
             http_timeout: None,
@@ -113,6 +118,12 @@ impl UpdaterConfig {
         self.api_base
             .clone()
             .unwrap_or_else(|| "https://api.github.com".to_string())
+    }
+
+    fn download_base(&self) -> String {
+        self.download_base
+            .clone()
+            .unwrap_or_else(|| "https://github.com".to_string())
     }
 }
 
@@ -294,12 +305,18 @@ impl Updater {
             );
         }
         let archive_url = format!(
-            "https://github.com/{}/releases/download/{}/{}",
-            self.config.repo_slug, latest.tag, asset_names.archive
+            "{}/{}/releases/download/{}/{}",
+            self.config.download_base(),
+            self.config.repo_slug,
+            latest.tag,
+            asset_names.archive
         );
         let checksum_url = format!(
-            "https://github.com/{}/releases/download/{}/{}",
-            self.config.repo_slug, latest.tag, asset_names.checksum
+            "{}/{}/releases/download/{}/{}",
+            self.config.download_base(),
+            self.config.repo_slug,
+            latest.tag,
+            asset_names.checksum
         );
         let agent = self.http_agent();
         let archive_bytes = download_bytes(&agent, &archive_url, &self.config.user_agent())?;
@@ -750,5 +767,131 @@ mod tests {
             !info.newer_than_current,
             "identical version must not be flagged as newer"
         );
+    }
+
+    /// Multi-route single-thread HTTP stub: serves `responses.len()` sequential
+    /// connections, choosing the body whose key is a substring of the request's
+    /// first request line (method + path). Returns the base URL plus the handle.
+    /// Standard-library only — no extra dependencies, no external network.
+    fn spawn_routed_http(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+        let count = responses.len();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 2048];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&buf[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = responses
+                    .iter()
+                    .find(|(needle, _)| request_line.contains(needle))
+                    .map(|(_, body)| body.clone())
+                    .unwrap_or_default();
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn run_update_stages_and_promotes_release_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let binary_in_archive = format!("toolx-{version}-{target}/toolx");
+        let payload = b"#!/bin/sh\necho updated-toolx\n";
+
+        // Build a real gzip tarball containing `<tool>-<ver>-<target>/<tool>`.
+        let mut tar_buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tar_buf, flate2::Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &binary_in_archive, &payload[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&tar_buf);
+        let digest = hex::encode(hasher.finalize());
+        let checksum_body = format!("{digest}  {archive_name}\n").into_bytes();
+
+        let api_body = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}"#
+        )
+        .into_bytes();
+
+        // Order matters: check_latest hits the API first, then stage_next downloads
+        // the archive and the checksum.
+        let (base, handle) = spawn_routed_http(vec![
+            ("releases/latest", api_body),
+            (archive_name.leak(), tar_buf),
+            (checksum_name.leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config).run_update().expect("run_update succeeds");
+        handle.join().unwrap();
+
+        assert_eq!(outcome.latest_version, version);
+        assert!(outcome.staged, "a newer release should be staged");
+        assert!(outcome.promoted, "staged binary should be promoted");
+        assert!(outcome.note.is_none());
+
+        // The promoted binary lands at `<install>/toolx`, executable, with our payload,
+        // and the staged `<install>/toolx_next` is consumed by the promotion.
+        let installed = tmp.path().join("toolx");
+        assert!(installed.exists(), "installed binary should exist");
+        assert!(!tmp.path().join("toolx_next").exists());
+        assert_eq!(fs::read(&installed).unwrap(), payload);
+        let mode = fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "installed binary should be chmod 0755");
+    }
+
+    #[test]
+    fn run_update_is_noop_when_latest_is_not_newer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api_body = br#"{"tag_name":"v0.1.0","assets":[]}"#.to_vec();
+        let (base, handle) = spawn_routed_http(vec![("releases/latest", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config).run_update().expect("run_update succeeds");
+        handle.join().unwrap();
+        assert!(!outcome.staged, "same version must not stage");
+        assert!(!outcome.promoted);
+        assert!(outcome.note.is_some(), "no-op should carry an explanatory note");
+        assert!(!tmp.path().join("toolx").exists());
+        assert!(!tmp.path().join("toolx_next").exists());
     }
 }
