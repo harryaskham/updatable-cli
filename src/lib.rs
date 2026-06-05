@@ -1047,4 +1047,37 @@ mod tests {
             "two distinct non-semver tags => treated as newer"
         );
     }
+
+    #[test]
+    fn register_update_tool_registers_the_three_self_update_tools() {
+        use mcp_cli::ToolRouter;
+
+        // A trivial host context; the builder closure ignores it.
+        struct Ctx;
+        let mut router: ToolRouter<Ctx> = ToolRouter::new();
+        register_update_tool(&mut router, |_ctx: &Ctx| {
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example")
+        });
+
+        let names: Vec<String> = router
+            .tool_metadata()
+            .into_iter()
+            .map(|meta| meta.name)
+            .collect();
+        assert_eq!(names.len(), 3, "expected exactly three tools, got {names:?}");
+        for expected in ["self_update_status", "self_update_check", "self_update_run"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing tool {expected}; registered: {names:?}"
+            );
+        }
+        // Every registered tool should carry a non-empty human description.
+        for meta in router.tool_metadata() {
+            assert!(
+                !meta.description.trim().is_empty(),
+                "tool {} has an empty description",
+                meta.name
+            );
+        }
+    }
 }
