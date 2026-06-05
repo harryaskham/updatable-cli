@@ -1012,4 +1012,39 @@ mod tests {
             "an archive missing the binary must not stage <tool>_next"
         );
     }
+
+    #[test]
+    fn is_newer_handles_semver_ordering_and_non_semver_fallback() {
+        // Helper: an Updater whose running version is `current`.
+        let updater_at = |current: &str| {
+            Updater::new(UpdaterConfig::new("toolx", current, "octocat/example"))
+        };
+
+        let u = updater_at("1.2.3");
+        // Strictly greater across patch/minor/major is newer.
+        assert!(u.is_newer("1.2.4"));
+        assert!(u.is_newer("1.3.0"));
+        assert!(u.is_newer("2.0.0"));
+        // Equal or lower is not newer.
+        assert!(!u.is_newer("1.2.3"));
+        assert!(!u.is_newer("1.2.2"));
+        assert!(!u.is_newer("1.1.9"));
+        // Semver pre-release rules: a stable release outranks its pre-release, and a
+        // pre-release is older than the corresponding stable current.
+        assert!(updater_at("1.0.0-rc.1").is_newer("1.0.0"));
+        assert!(!updater_at("1.0.0").is_newer("1.0.0-rc.1"));
+
+        // Non-semver fallback: when either side does not parse, "newer" degrades to a
+        // plain string inequality (any different tag is treated as an update).
+        let n = updater_at("0.1.0");
+        assert!(n.is_newer("nightly"), "different non-semver tag => treated as newer");
+        assert!(
+            !updater_at("nightly").is_newer("nightly"),
+            "identical non-semver tag => not newer"
+        );
+        assert!(
+            updater_at("nightly").is_newer("rolling"),
+            "two distinct non-semver tags => treated as newer"
+        );
+    }
 }
