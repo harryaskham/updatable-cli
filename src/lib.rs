@@ -1080,4 +1080,15 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn maybe_apply_staged_update_is_a_clean_noop_when_nothing_is_staged() {
+        // In the test binary, current_exe() is the test runner and there is no
+        // `<runner>_next` sibling, so the startup hook must return Ok(()) without
+        // erroring or touching the filesystem. This guards the early-return guard
+        // that every normal program launch relies on. Use a unique, unlikely tool
+        // name so we never collide with a real staged sibling.
+        let result = maybe_apply_staged_update("updatable_cli_unlikely_tool_name_xyz");
+        assert!(result.is_ok(), "no-op startup hook should not error: {result:?}");
+    }
 }
