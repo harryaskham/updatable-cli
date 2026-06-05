@@ -894,4 +894,122 @@ mod tests {
         assert!(!tmp.path().join("toolx").exists());
         assert!(!tmp.path().join("toolx_next").exists());
     }
+
+    /// Build a gzip tarball containing a single entry at `inner_path`. Returns the
+    /// compressed bytes; used by the failure-mode tests to craft good and bad archives.
+    fn gzip_tar_with_entry(inner_path: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let enc = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append_data(&mut header, inner_path, payload).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn stage_next_errors_when_release_is_missing_the_expected_asset() {
+        // The release advertises no matching archive, so stage_next must bail before
+        // any download and must not stage a binary. No HTTP server needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        let latest = LatestReleaseInfo {
+            tag: "v9.9.9".to_string(),
+            version: "9.9.9".to_string(),
+            html_url: None,
+            assets: vec!["some-unrelated-asset.txt".to_string()],
+            newer_than_current: true,
+        };
+        let err = updater.stage_next(&latest).unwrap_err();
+        assert!(
+            err.to_string().contains("has no asset"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !updater.config().next_binary_path().unwrap().exists(),
+            "nothing should be staged when the asset is missing"
+        );
+    }
+
+    #[test]
+    fn stage_next_rejects_checksum_mismatch_and_stages_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let inner = format!("toolx-{version}-{target}/toolx");
+        let tarball = gzip_tar_with_entry(&inner, b"#!/bin/sh\nexit 0\n");
+        // Deliberately wrong digest for the archive.
+        let bad_checksum = format!("{}  {archive_name}\n", "0".repeat(64)).into_bytes();
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), bad_checksum),
+        ]);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.download_base = Some(base);
+        let latest = LatestReleaseInfo {
+            tag: format!("v{version}"),
+            version: version.to_string(),
+            html_url: None,
+            assets: vec![archive_name, checksum_name],
+            newer_than_current: true,
+        };
+        let err = Updater::new(config).stage_next(&latest).unwrap_err();
+        handle.join().unwrap();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !tmp.path().join("toolx_next").exists(),
+            "a checksum mismatch must never stage <tool>_next"
+        );
+    }
+
+    #[test]
+    fn stage_next_errors_when_archive_lacks_expected_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        // Valid archive + correct checksum, but the inner path is wrong, so the
+        // expected `<tool>-<ver>-<target>/<tool>` is absent.
+        let tarball = gzip_tar_with_entry("some-other-dir/not-toolx", b"payload\n");
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let good_checksum = format!("{}  {archive_name}\n", hex::encode(hasher.finalize()))
+            .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), good_checksum),
+        ]);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.download_base = Some(base);
+        let latest = LatestReleaseInfo {
+            tag: format!("v{version}"),
+            version: version.to_string(),
+            html_url: None,
+            assets: vec![archive_name, checksum_name],
+            newer_than_current: true,
+        };
+        let err = Updater::new(config).stage_next(&latest).unwrap_err();
+        handle.join().unwrap();
+        assert!(
+            err.to_string().contains("did not contain"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !tmp.path().join("toolx_next").exists(),
+            "an archive missing the binary must not stage <tool>_next"
+        );
+    }
 }
