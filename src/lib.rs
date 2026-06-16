@@ -99,9 +99,7 @@ impl UpdaterConfig {
     }
 
     pub fn next_binary_path(&self) -> Result<PathBuf> {
-        Ok(self
-            .install_dir()?
-            .join(format!("{}_next", self.tool_name)))
+        Ok(self.install_dir()?.join(format!("{}_next", self.tool_name)))
     }
 
     pub fn installed_binary_path(&self) -> Result<PathBuf> {
@@ -109,9 +107,9 @@ impl UpdaterConfig {
     }
 
     fn user_agent(&self) -> String {
-        self.user_agent.clone().unwrap_or_else(|| {
-            format!("{}-updater/{}", self.tool_name, self.current_version)
-        })
+        self.user_agent
+            .clone()
+            .unwrap_or_else(|| format!("{}-updater/{}", self.tool_name, self.current_version))
     }
 
     fn api_base(&self) -> String {
@@ -128,17 +126,16 @@ impl UpdaterConfig {
 }
 
 /// Describes how to derive the release asset name + checksum name for a given release.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum AssetStrategy {
     /// `<tool>-<version>-<target>.tar.gz` + `.sha256`, where `<target>` matches Tendril/caco
     /// conventions (e.g. `x86_64-linux`, `aarch64-darwin`). The packed tarball is expected to
     /// contain `<tool>-<version>-<target>/<tool>`.
+    #[default]
     TendrilStyle,
     /// Custom strategy: the closure returns `(asset_name, checksum_name, binary_path_in_tar)`.
     #[allow(clippy::type_complexity)]
-    Custom(
-        std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<AssetNames> + Send + Sync>,
-    ),
+    Custom(std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<AssetNames> + Send + Sync>),
 }
 
 impl std::fmt::Debug for AssetStrategy {
@@ -147,12 +144,6 @@ impl std::fmt::Debug for AssetStrategy {
             Self::TendrilStyle => f.write_str("TendrilStyle"),
             Self::Custom(_) => f.write_str("Custom(<fn>)"),
         }
-    }
-}
-
-impl Default for AssetStrategy {
-    fn default() -> Self {
-        Self::TendrilStyle
     }
 }
 
@@ -285,8 +276,14 @@ impl Updater {
         let target = release_target()?;
         let asset_names = match &self.config.asset_strategy {
             AssetStrategy::TendrilStyle => AssetNames {
-                archive: format!("{}-{}-{}.tar.gz", self.config.tool_name, latest.version, target),
-                checksum: format!("{}-{}-{}.sha256", self.config.tool_name, latest.version, target),
+                archive: format!(
+                    "{}-{}-{}.tar.gz",
+                    self.config.tool_name, latest.version, target
+                ),
+                checksum: format!(
+                    "{}-{}-{}.sha256",
+                    self.config.tool_name, latest.version, target
+                ),
                 binary_in_archive: format!(
                     "{}-{}-{}/{}",
                     self.config.tool_name, latest.version, target, self.config.tool_name
@@ -296,7 +293,11 @@ impl Updater {
                 strategy(&self.config.tool_name, &latest.version, &target)?
             }
         };
-        if !latest.assets.iter().any(|name| name == &asset_names.archive) {
+        if !latest
+            .assets
+            .iter()
+            .any(|name| name == &asset_names.archive)
+        {
             bail!(
                 "release {} has no asset {} (available: {:?})",
                 latest.tag,
@@ -430,9 +431,7 @@ fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<
     hasher.update(bytes);
     let actual = hex::encode(hasher.finalize());
     if expected != actual {
-        bail!(
-            "checksum mismatch for {asset_name}: expected {expected}, got {actual}"
-        );
+        bail!("checksum mismatch for {asset_name}: expected {expected}, got {actual}");
     }
     Ok(())
 }
@@ -442,8 +441,8 @@ fn atomic_write(destination: &Path, source: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("destination {} has no parent", destination.display()))?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    let mut src = fs::File::open(source)
-        .with_context(|| format!("open source {}", source.display()))?;
+    let mut src =
+        fs::File::open(source).with_context(|| format!("open source {}", source.display()))?;
     std::io::copy(&mut src, tmp.as_file_mut())?;
     tmp.flush()?;
     tmp.persist(destination)
@@ -572,9 +571,7 @@ pub fn register_update_tool<C: Send + Sync + 'static>(
         "Stage the latest release as <tool>_next and atomically promote it.",
         move |context: &C, _input: EmptyArgs| {
             let config = update_builder(context);
-            Updater::new(config)
-                .run_update()
-                .map_err(UpdateError::from)
+            Updater::new(config).run_update().map_err(UpdateError::from)
         },
     );
 }
@@ -658,7 +655,10 @@ mod tests {
         // No `<tool>_next` staged yet: promotion must report that nothing happened
         // and must not create the installed binary.
         let promoted = updater.promote_next().unwrap();
-        assert!(promoted.is_none(), "expected no promotion when nothing staged");
+        assert!(
+            promoted.is_none(),
+            "expected no promotion when nothing staged"
+        );
         assert!(!updater.config().installed_binary_path().unwrap().exists());
     }
 
@@ -683,7 +683,10 @@ mod tests {
         assert_eq!(installed, expected);
         // Staged path consumed, installed path created and executable.
         assert!(!next_path.exists(), "staged binary should be renamed away");
-        assert!(expected.exists(), "installed binary should exist after promotion");
+        assert!(
+            expected.exists(),
+            "installed binary should exist after promotion"
+        );
         let mode = fs::metadata(&expected).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "installed binary should be chmod 0755");
         assert_eq!(fs::read(&expected).unwrap(), b"#!/bin/sh\nexit 0\n");
@@ -734,7 +737,9 @@ mod tests {
         let (base, handle) = spawn_one_shot_http(body);
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.api_base = Some(base);
-        let info = Updater::new(config).check_latest().expect("check_latest succeeds");
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
         handle.join().unwrap();
         assert_eq!(info.tag, "v9.9.9");
         assert_eq!(info.version, "9.9.9");
@@ -758,7 +763,9 @@ mod tests {
         let (base, handle) = spawn_one_shot_http(body);
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.api_base = Some(base);
-        let info = Updater::new(config).check_latest().expect("check_latest succeeds");
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
         handle.join().unwrap();
         assert_eq!(info.version, "0.1.0");
         assert!(info.assets.is_empty());
@@ -859,7 +866,9 @@ mod tests {
         config.install_dir = Some(tmp.path().to_path_buf());
         config.api_base = Some(base.clone());
         config.download_base = Some(base);
-        let outcome = Updater::new(config).run_update().expect("run_update succeeds");
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
         handle.join().unwrap();
 
         assert_eq!(outcome.latest_version, version);
@@ -886,11 +895,16 @@ mod tests {
         config.install_dir = Some(tmp.path().to_path_buf());
         config.api_base = Some(base.clone());
         config.download_base = Some(base);
-        let outcome = Updater::new(config).run_update().expect("run_update succeeds");
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
         handle.join().unwrap();
         assert!(!outcome.staged, "same version must not stage");
         assert!(!outcome.promoted);
-        assert!(outcome.note.is_some(), "no-op should carry an explanatory note");
+        assert!(
+            outcome.note.is_some(),
+            "no-op should carry an explanatory note"
+        );
         assert!(!tmp.path().join("toolx").exists());
         assert!(!tmp.path().join("toolx_next").exists());
     }
@@ -905,7 +919,9 @@ mod tests {
         header.set_size(payload.len() as u64);
         header.set_mode(0o755);
         header.set_cksum();
-        builder.append_data(&mut header, inner_path, payload).unwrap();
+        builder
+            .append_data(&mut header, inner_path, payload)
+            .unwrap();
         builder.into_inner().unwrap().finish().unwrap();
         out
     }
@@ -985,8 +1001,8 @@ mod tests {
         let tarball = gzip_tar_with_entry("some-other-dir/not-toolx", b"payload\n");
         let mut hasher = Sha256::new();
         hasher.update(&tarball);
-        let good_checksum = format!("{}  {archive_name}\n", hex::encode(hasher.finalize()))
-            .into_bytes();
+        let good_checksum =
+            format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
         let (base, handle) = spawn_routed_http(vec![
             (archive_name.clone().leak(), tarball),
             (checksum_name.clone().leak(), good_checksum),
@@ -1016,9 +1032,8 @@ mod tests {
     #[test]
     fn is_newer_handles_semver_ordering_and_non_semver_fallback() {
         // Helper: an Updater whose running version is `current`.
-        let updater_at = |current: &str| {
-            Updater::new(UpdaterConfig::new("toolx", current, "octocat/example"))
-        };
+        let updater_at =
+            |current: &str| Updater::new(UpdaterConfig::new("toolx", current, "octocat/example"));
 
         let u = updater_at("1.2.3");
         // Strictly greater across patch/minor/major is newer.
@@ -1037,7 +1052,10 @@ mod tests {
         // Non-semver fallback: when either side does not parse, "newer" degrades to a
         // plain string inequality (any different tag is treated as an update).
         let n = updater_at("0.1.0");
-        assert!(n.is_newer("nightly"), "different non-semver tag => treated as newer");
+        assert!(
+            n.is_newer("nightly"),
+            "different non-semver tag => treated as newer"
+        );
         assert!(
             !updater_at("nightly").is_newer("nightly"),
             "identical non-semver tag => not newer"
@@ -1064,7 +1082,11 @@ mod tests {
             .into_iter()
             .map(|meta| meta.name)
             .collect();
-        assert_eq!(names.len(), 3, "expected exactly three tools, got {names:?}");
+        assert_eq!(
+            names.len(),
+            3,
+            "expected exactly three tools, got {names:?}"
+        );
         for expected in ["self_update_status", "self_update_check", "self_update_run"] {
             assert!(
                 names.iter().any(|name| name == expected),
@@ -1089,6 +1111,9 @@ mod tests {
         // that every normal program launch relies on. Use a unique, unlikely tool
         // name so we never collide with a real staged sibling.
         let result = maybe_apply_staged_update("updatable_cli_unlikely_tool_name_xyz");
-        assert!(result.is_ok(), "no-op startup hook should not error: {result:?}");
+        assert!(
+            result.is_ok(),
+            "no-op startup hook should not error: {result:?}"
+        );
     }
 }
