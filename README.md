@@ -84,5 +84,44 @@ Custom strategies are supported via `AssetStrategy::Custom`.
   GitHub Enterprise, a release mirror, or an air-gapped host that serves
   `<base>/<owner>/<repo>/releases/download/<tag>/<asset>`.
 - `install_dir` — overrides the default `$HOME/.local/bin`.
-- `github_token` — sent as a bearer token for higher rate limits or private repos.
+- `github_token` — sent as `Authorization: Bearer <token>` on both the release-metadata
+  request **and** the asset/checksum downloads, so private-repo releases update
+  end-to-end. The bearer is dropped automatically when GitHub redirects the asset to a
+  signed object-store URL on a different host, so the credential is never leaked to the
+  CDN.
+- `gh_account` — GitHub username to source a token from the local `gh` CLI when
+  `github_token` is unset. The updater runs `gh auth token --user <account>`, which is
+  handy for selecting one of several logged-in `gh` accounts (e.g. the one with access to
+  a private release repo).
+- `gh_token_fallback` — when `true` and `github_token` is unset, fall back to
+  `gh auth token` (honoring `gh_account` if set). Defaults to `false`, so public-repo
+  callers never shell out to `gh`.
 - `http_timeout` — per-request timeout (default 60s).
+
+### Private repositories
+
+The simplest path is to hand the crate a token directly:
+
+```rust,ignore
+let config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/private-tool")
+    .with_github_token(std::env::var("GITHUB_TOKEN")?);
+```
+
+If you would rather reuse whatever the operator's `gh` CLI is already authenticated with —
+including picking a specific account when several are logged in — configure an account and
+let the crate fetch the token on demand:
+
+```rust,ignore
+// Uses `gh auth token --user octocat` only when no explicit github_token is set.
+let config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/private-tool")
+    .with_gh_account("octocat");
+
+// Or fall back to the active `gh` account without naming one:
+let config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/private-tool")
+    .with_gh_token_fallback(true);
+```
+
+Resolution order is: explicit `github_token`, then `gh auth token [--user <gh_account>]`
+(only when `gh_account` is set or `gh_token_fallback` is `true`), then anonymous. The
+standalone `gh_auth_token(account)` helper is also exported if you want to resolve a token
+yourself.

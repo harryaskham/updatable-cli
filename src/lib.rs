@@ -50,8 +50,19 @@ pub struct UpdaterConfig {
     pub download_base: Option<String>,
     /// Optional User-Agent header. Defaults to `<tool>-updater/<current_version>`.
     pub user_agent: Option<String>,
-    /// Optional GitHub token for higher rate limits / private repos.
+    /// Optional GitHub token for higher rate limits / private repos. Sent as
+    /// `Authorization: Bearer <token>` on both the release-metadata request and the
+    /// asset/checksum downloads. Takes precedence over [`gh_account`]/[`gh_token_fallback`].
     pub github_token: Option<String>,
+    /// Optional GitHub account/username to source a token from the local `gh` CLI when
+    /// [`github_token`] is unset. When `Some`, the updater runs `gh auth token --user
+    /// <account>` to obtain a token (useful for selecting one of several logged-in `gh`
+    /// accounts, e.g. to reach a private release repo).
+    pub gh_account: Option<String>,
+    /// When `true` and [`github_token`] is unset, fall back to `gh auth token` (honoring
+    /// [`gh_account`] if set) to source a token from the local `gh` CLI. Defaults to
+    /// `false` so public-repo callers never shell out to `gh`.
+    pub gh_token_fallback: bool,
     /// HTTP request timeout. Defaults to 60 seconds.
     pub http_timeout: Option<Duration>,
 }
@@ -84,6 +95,8 @@ impl UpdaterConfig {
             download_base: None,
             user_agent: None,
             github_token: None,
+            gh_account: None,
+            gh_token_fallback: false,
             http_timeout: None,
         }
     }
@@ -122,6 +135,49 @@ impl UpdaterConfig {
         self.download_base
             .clone()
             .unwrap_or_else(|| "https://github.com".to_string())
+    }
+
+    /// Set an explicit GitHub token (chainable). Takes precedence over any `gh` fallback.
+    pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(token.into());
+        self
+    }
+
+    /// Select a `gh` account/username to source a token from when no explicit token is
+    /// set (chainable). Implies the `gh auth token --user <account>` fallback.
+    pub fn with_gh_account(mut self, account: impl Into<String>) -> Self {
+        self.gh_account = Some(account.into());
+        self
+    }
+
+    /// Enable/disable the `gh auth token` fallback for when no explicit token is set
+    /// (chainable). Honors [`gh_account`](Self::gh_account) when set.
+    pub fn with_gh_token_fallback(mut self, enabled: bool) -> Self {
+        self.gh_token_fallback = enabled;
+        self
+    }
+
+    /// Resolve the bearer token to use for GitHub requests.
+    ///
+    /// Resolution order:
+    /// 1. An explicit, non-empty [`github_token`](Self::github_token).
+    /// 2. Otherwise, when [`gh_account`](Self::gh_account) is set or
+    ///    [`gh_token_fallback`](Self::gh_token_fallback) is `true`, the output of
+    ///    `gh auth token [--user <gh_account>]`.
+    /// 3. Otherwise `None`.
+    ///
+    /// `gh` is only invoked for case 2, so default public-repo callers never shell out.
+    pub fn resolved_token(&self) -> Option<String> {
+        if let Some(token) = &self.github_token {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if self.gh_account.is_some() || self.gh_token_fallback {
+            return gh_auth_token(self.gh_account.as_deref());
+        }
+        None
     }
 }
 
@@ -221,7 +277,7 @@ impl Updater {
         );
         let agent = self.http_agent();
         let mut request = agent.get(&url).set("User-Agent", &self.config.user_agent());
-        if let Some(token) = &self.config.github_token {
+        if let Some(token) = self.config.resolved_token() {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
         let response = request
@@ -319,9 +375,20 @@ impl Updater {
             latest.tag,
             asset_names.checksum
         );
-        let agent = self.http_agent();
-        let archive_bytes = download_bytes(&agent, &archive_url, &self.config.user_agent())?;
-        let checksum_text = download_text(&agent, &checksum_url, &self.config.user_agent())?;
+        let token = self.config.resolved_token();
+        let timeout = self.config.http_timeout.unwrap_or(Duration::from_secs(60));
+        let archive_bytes = download_bytes(
+            &archive_url,
+            &self.config.user_agent(),
+            token.as_deref(),
+            timeout,
+        )?;
+        let checksum_text = download_text(
+            &checksum_url,
+            &self.config.user_agent(),
+            token.as_deref(),
+            timeout,
+        )?;
         verify_sha256(&archive_bytes, &checksum_text, &asset_names.archive)?;
 
         let tmp = tempfile::tempdir().context("create tempdir for staging release tarball")?;
@@ -405,20 +472,126 @@ impl Updater {
     }
 }
 
-fn download_bytes(agent: &ureq::Agent, url: &str, user_agent: &str) -> Result<Vec<u8>> {
-    let response = agent
-        .get(url)
-        .set("User-Agent", user_agent)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    let mut buf = Vec::new();
-    response.into_reader().read_to_end(&mut buf)?;
-    Ok(buf)
+/// Download `url` following redirects manually so that an `Authorization` bearer is
+/// only ever sent to the original host. GitHub release-asset downloads 302 to a signed
+/// object-store URL that rejects (or does not need) the GitHub credential, so credentials
+/// MUST NOT be forwarded across a host change.
+fn download_bytes(
+    url: &str,
+    user_agent: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    // redirects(0): we follow them ourselves to control credential forwarding.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .redirects(0)
+        .build();
+    let origin_host = url_host(url);
+    let mut current = url.to_string();
+    let mut send_auth = token.is_some();
+    for _ in 0..10 {
+        let mut request = agent.get(&current).set("User-Agent", user_agent);
+        if send_auth {
+            if let Some(token) = token {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+        }
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code, _)) => {
+                bail!("GET {current} returned HTTP {code}");
+            }
+            Err(err) => return Err(anyhow!("GET {current}: {err}")),
+        };
+        let status = response.status();
+        if (300..400).contains(&status) {
+            let location = response
+                .header("location")
+                .ok_or_else(|| anyhow!("HTTP {status} redirect without Location for {current}"))?
+                .to_string();
+            let next = resolve_location(&current, &location)?;
+            // Never forward the bearer to a different host (e.g. GitHub -> signed S3 URL).
+            if url_host(&next) != origin_host {
+                send_auth = false;
+            }
+            current = next;
+            continue;
+        }
+        let mut buf = Vec::new();
+        response.into_reader().read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+    bail!("too many redirects while fetching {url}")
 }
 
-fn download_text(agent: &ureq::Agent, url: &str, user_agent: &str) -> Result<String> {
-    String::from_utf8(download_bytes(agent, url, user_agent)?)
+fn download_text(
+    url: &str,
+    user_agent: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    String::from_utf8(download_bytes(url, user_agent, token, timeout)?)
         .map_err(|err| anyhow!("checksum was not UTF-8: {err}"))
+}
+
+/// Lowercased `host[:port]` of an absolute URL, or `""` when it cannot be parsed.
+fn url_host(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Resolve a `Location` header against the request URL. Handles absolute URLs,
+/// protocol-relative (`//host/...`), absolute-path (`/...`), and simple relative paths.
+fn resolve_location(base: &str, location: &str) -> Result<String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_string());
+    }
+    let (scheme, rest) = base
+        .split_once("://")
+        .ok_or_else(|| anyhow!("cannot resolve redirect against non-absolute base {base}"))?;
+    if let Some(after) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{after}"));
+    }
+    let host = rest.split('/').next().unwrap_or(rest);
+    if let Some(path) = location.strip_prefix('/') {
+        return Ok(format!("{scheme}://{host}/{path}"));
+    }
+    // Relative path: replace the last segment of the base path.
+    let base_no_query = base.split('?').next().unwrap_or(base);
+    let parent = base_no_query
+        .rsplit_once('/')
+        .map(|(left, _)| left)
+        .unwrap_or(base_no_query);
+    Ok(format!("{parent}/{location}"))
+}
+
+/// Best-effort: ask the locally-installed `gh` CLI for an auth token.
+///
+/// Runs `gh auth token` (optionally scoped to `--user <account>`), returning the trimmed
+/// token on success. Returns `None` when `gh` is missing, the user is not authenticated,
+/// or the account is unknown — callers treat that as "no token available".
+pub fn gh_auth_token(account: Option<&str>) -> Option<String> {
+    let mut command = std::process::Command::new("gh");
+    command.arg("auth").arg("token");
+    if let Some(account) = account {
+        if !account.is_empty() {
+            command.arg("--user").arg(account);
+        }
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?;
+    let token = token.trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
 }
 
 fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<()> {
@@ -1115,5 +1288,197 @@ mod tests {
             result.is_ok(),
             "no-op startup hook should not error: {result:?}"
         );
+    }
+
+    /// Reply shape for the recording HTTP stub.
+    #[derive(Clone)]
+    enum MockReply {
+        Body(Vec<u8>),
+        Redirect(String),
+    }
+
+    type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Like `spawn_routed_http`, but also records each request's first line and its
+    /// `Authorization` header (if any), and can answer with a 302 redirect. Used to
+    /// assert credential forwarding behaviour without external network.
+    fn spawn_recording_http(
+        routes: Vec<(&'static str, MockReply)>,
+    ) -> (String, AuthLog, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+        let log: AuthLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_thread = log.clone();
+        let count = routes.len();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let request_line = request.lines().next().unwrap_or("").to_string();
+                let authorization = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .and_then(|line| line.split_once(':'))
+                    .map(|(_, value)| value.trim().to_string());
+                log_thread
+                    .lock()
+                    .unwrap()
+                    .push((request_line.clone(), authorization));
+                let reply = routes
+                    .iter()
+                    .find(|(needle, _)| request_line.contains(needle))
+                    .map(|(_, reply)| reply.clone())
+                    .unwrap_or(MockReply::Body(Vec::new()));
+                let response = match reply {
+                    MockReply::Body(body) => {
+                        let mut bytes = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        bytes.extend_from_slice(&body);
+                        bytes
+                    }
+                    MockReply::Redirect(location) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes(),
+                };
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        (base, log, handle)
+    }
+
+    #[test]
+    fn resolved_token_prefers_explicit_token_and_trims_it() {
+        // An explicit token wins and is whitespace-trimmed; `gh` is never consulted
+        // (no gh_account / gh_token_fallback opt-in set).
+        let config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example")
+            .with_github_token("  tok-123  ");
+        assert_eq!(config.resolved_token().as_deref(), Some("tok-123"));
+
+        // No token and no gh opt-in => None, without shelling out to gh.
+        let bare = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        assert_eq!(bare.resolved_token(), None);
+
+        // An empty/whitespace token is treated as absent (and still no gh opt-in).
+        let blank =
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example").with_github_token("   ");
+        assert_eq!(blank.resolved_token(), None);
+    }
+
+    #[test]
+    fn download_bytes_sends_bearer_to_origin_and_omits_it_without_token() {
+        // With a token: Authorization: Bearer <token> is sent to the origin host.
+        let (base, log, handle) =
+            spawn_recording_http(vec![("asset", MockReply::Body(b"payload".to_vec()))]);
+        let url = format!("{base}/asset");
+        let bytes =
+            download_bytes(&url, "ua/1.0", Some("secret-xyz"), Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(bytes, b"payload");
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1.as_deref(), Some("Bearer secret-xyz"));
+
+        // Without a token: no Authorization header is sent at all.
+        let (base, log, handle) =
+            spawn_recording_http(vec![("asset", MockReply::Body(b"payload".to_vec()))]);
+        let url = format!("{base}/asset");
+        let bytes = download_bytes(&url, "ua/1.0", None, Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(log.lock().unwrap()[0].1, None);
+    }
+
+    #[test]
+    fn download_bytes_strips_authorization_on_cross_host_redirect() {
+        // The signed-object host (server B) must NOT receive the GitHub bearer.
+        let (base_b, log_b, handle_b) =
+            spawn_recording_http(vec![("signed", MockReply::Body(b"object-bytes".to_vec()))]);
+        let (base_a, log_a, handle_a) = spawn_recording_http(vec![(
+            "archive",
+            MockReply::Redirect(format!("{base_b}/signed")),
+        )]);
+
+        let url = format!("{base_a}/archive");
+        let bytes =
+            download_bytes(&url, "ua/1.0", Some("secret-xyz"), Duration::from_secs(5)).unwrap();
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        assert_eq!(
+            bytes, b"object-bytes",
+            "final object bytes should be returned"
+        );
+        // Origin (GitHub) leg carried the bearer.
+        assert_eq!(
+            log_a.lock().unwrap()[0].1.as_deref(),
+            Some("Bearer secret-xyz")
+        );
+        // Redirected (signed-URL) leg must have NO Authorization header.
+        assert_eq!(
+            log_b.lock().unwrap()[0].1,
+            None,
+            "credentials must not be forwarded across a host change"
+        );
+    }
+
+    #[test]
+    fn run_update_attaches_token_to_metadata_and_asset_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let binary_in_archive = format!("toolx-{version}-{target}/toolx");
+        let tarball = gzip_tar_with_entry(&binary_in_archive, b"#!/bin/sh\nexit 0\n");
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let checksum_body =
+            format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
+        let api_body = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}"#
+        )
+        .into_bytes();
+
+        let (base, log, handle) = spawn_recording_http(vec![
+            ("releases/latest", MockReply::Body(api_body)),
+            (archive_name.clone().leak(), MockReply::Body(tarball)),
+            (checksum_name.clone().leak(), MockReply::Body(checksum_body)),
+        ]);
+        let mut config =
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example").with_github_token("secret-xyz");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
+        handle.join().unwrap();
+
+        assert!(
+            outcome.promoted,
+            "a newer private release should be promoted"
+        );
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded.len(), 3, "metadata + archive + checksum");
+        for (line, authorization) in recorded.iter() {
+            assert_eq!(
+                authorization.as_deref(),
+                Some("Bearer secret-xyz"),
+                "request {line:?} should carry the bearer token"
+            );
+        }
     }
 }
