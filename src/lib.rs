@@ -20,6 +20,27 @@
 //! APIs for executable-bit handling and `exec`-style re-spawning, and
 //! [`release_target`] only resolves the `x86_64`/`aarch64` linux/darwin asset targets.
 //! Windows is not supported.
+//!
+//! ## Example
+//!
+//! Report install status without any network or filesystem writes (`current_status`
+//! only computes paths and stats them):
+//!
+//! ```
+//! use std::path::PathBuf;
+//! use updatable_cli::{Updater, UpdaterConfig};
+//!
+//! let mut config = UpdaterConfig::new("mytool", "1.2.3", "octocat/mytool");
+//! // Point at any directory so the example never touches a real install path.
+//! config.install_dir = Some(PathBuf::from("/tmp/updatable-cli-doc-example"));
+//!
+//! let status = Updater::new(config).current_status()?;
+//! assert_eq!(status.tool, "mytool");
+//! assert_eq!(status.current_version, "1.2.3");
+//! assert!(status.installed_path.ends_with("mytool"));
+//! assert!(status.next_path.ends_with("mytool_next"));
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 
 use std::fs;
 use std::io::{Read, Write};
