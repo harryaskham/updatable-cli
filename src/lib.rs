@@ -287,10 +287,26 @@ impl Updater {
         if let Some(token) = self.config.resolved_token() {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
-        let response = request
-            .call()
-            .with_context(|| format!("GET {url}"))?
-            .into_json::<serde_json::Value>()?;
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(404, _)) => {
+                bail!(
+                    "no published GitHub releases for {} yet (GET {url} returned 404)",
+                    self.config.repo_slug
+                );
+            }
+            Err(ureq::Error::Status(code, _)) if code == 403 || code == 429 => {
+                bail!(
+                    "GitHub API request was rate-limited or forbidden (HTTP {code}) for {url}; \
+                     set a token via UpdaterConfig::with_github_token or with_gh_token_fallback to raise the limit"
+                );
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                bail!("GET {url} returned HTTP {code}");
+            }
+            Err(err) => return Err(anyhow!("GET {url}: {err}")),
+        }
+        .into_json::<serde_json::Value>()?;
         let tag = response
             .get("tag_name")
             .and_then(|value| value.as_str())
@@ -946,6 +962,69 @@ mod tests {
         assert!(
             !info.newer_than_current,
             "identical version must not be flagged as newer"
+        );
+    }
+
+    /// Like `spawn_one_shot_http` but responds with an arbitrary status line, for
+    /// exercising check_latest error paths (404 no-releases, 403 rate-limit, ...).
+    fn spawn_one_shot_http_status(
+        status_line: &'static str,
+        body: String,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn check_latest_reports_friendly_error_when_no_releases() {
+        let (base, handle) =
+            spawn_one_shot_http_status("404 Not Found", r#"{"message":"Not Found"}"#.to_string());
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let err = Updater::new(config)
+            .check_latest()
+            .expect_err("a 404 from the releases endpoint must surface as an error");
+        handle.join().unwrap();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no published GitHub releases for octocat/example"),
+            "expected a friendly no-releases message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_latest_reports_rate_limit_hint_on_403() {
+        let (base, handle) = spawn_one_shot_http_status(
+            "403 Forbidden",
+            r#"{"message":"API rate limit exceeded"}"#.to_string(),
+        );
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let err = Updater::new(config)
+            .check_latest()
+            .expect_err("a 403 from the releases endpoint must surface as an error");
+        handle.join().unwrap();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rate-limited or forbidden") && msg.contains("with_github_token"),
+            "expected a rate-limit/token hint, got: {msg}"
         );
     }
 
