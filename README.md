@@ -75,6 +75,12 @@ By default the crate expects Tendril-style release assets:
 where `<target>` is `x86_64-linux` / `aarch64-linux` / `aarch64-darwin` / `x86_64-darwin`.
 Custom strategies are supported via `AssetStrategy::Custom`.
 
+## Platform support
+
+This crate is **Unix-only (Linux and macOS)**. It relies on `std::os::unix` APIs for the
+executable bit and `exec`-style re-spawn, and `release_target()` only resolves the
+`x86_64`/`aarch64` linux/darwin asset targets above. Windows is not supported.
+
 ## Host overrides
 
 `UpdaterConfig` exposes a few optional overrides (all default to the standard GitHub setup):

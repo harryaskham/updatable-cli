@@ -13,6 +13,13 @@
 //!
 //! The host runtime is also expected to call [`maybe_apply_staged_update`] at process entry
 //! so that a freshly staged `<tool>_next` is promoted before the rest of the binary runs.
+//!
+//! ## Platform support
+//!
+//! This crate targets **Unix only (Linux and macOS)**. It depends on `std::os::unix`
+//! APIs for executable-bit handling and `exec`-style re-spawning, and
+//! [`release_target`] only resolves the `x86_64`/`aarch64` linux/darwin asset targets.
+//! Windows is not supported.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -676,22 +683,15 @@ pub fn maybe_apply_staged_update(tool_name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+// This crate is Unix-only (Linux/macOS): it unconditionally relies on
+// `std::os::unix` APIs (`PermissionsExt::set_mode`, `CommandExt::exec`) and
+// `release_target` only maps the linux/darwin asset targets, so there is no
+// non-Unix build to fall back to.
 fn exec_replace(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     cmd.exec()
-}
-
-#[cfg(not(unix))]
-fn exec_replace(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> std::io::Error {
-    match std::process::Command::new(program).args(args).status() {
-        Ok(status) => {
-            std::process::exit(status.code().unwrap_or(0));
-        }
-        Err(err) => err,
-    }
 }
 
 /// Caco/Tendril-style platform suffix: `<arch>-<os>` (`x86_64-linux`, `aarch64-darwin`, ...).
