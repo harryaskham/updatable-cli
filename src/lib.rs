@@ -41,6 +41,28 @@
 //! assert!(status.next_path.ends_with("mytool_next"));
 //! # Ok::<(), anyhow::Error>(())
 //! ```
+//!
+//! ## MCP tools
+//!
+//! Expose the same surface as `self_update_status` / `self_update_check` /
+//! `self_update_run` on an existing `mcp-cli` router, where `Ctx` is your host context:
+//!
+//! ```
+//! use mcp_cli::ToolRouter;
+//! use updatable_cli::{UpdaterConfig, register_update_tool};
+//!
+//! struct Ctx;
+//!
+//! let mut router: ToolRouter<Ctx> = ToolRouter::new();
+//! register_update_tool(&mut router, |_ctx: &Ctx| {
+//!     UpdaterConfig::new("mytool", "1.2.3", "octocat/mytool")
+//! });
+//!
+//! let names: Vec<String> = router.tool_metadata().into_iter().map(|m| m.name).collect();
+//! assert!(names.iter().any(|n| n == "self_update_status"));
+//! assert!(names.iter().any(|n| n == "self_update_check"));
+//! assert!(names.iter().any(|n| n == "self_update_run"));
+//! ```
 
 use std::fs;
 use std::io::{Read, Write};
