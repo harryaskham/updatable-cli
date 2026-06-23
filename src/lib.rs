@@ -63,6 +63,7 @@
 //! assert!(names.iter().any(|n| n == "self_update_check"));
 //! assert!(names.iter().any(|n| n == "self_update_run"));
 //! ```
+#![warn(missing_docs)]
 
 use std::fs;
 use std::io::{Read, Write};
@@ -102,15 +103,15 @@ pub struct UpdaterConfig {
     pub user_agent: Option<String>,
     /// Optional GitHub token for higher rate limits / private repos. Sent as
     /// `Authorization: Bearer <token>` on both the release-metadata request and the
-    /// asset/checksum downloads. Takes precedence over [`gh_account`]/[`gh_token_fallback`].
+    /// asset/checksum downloads. Takes precedence over `gh_account`/`gh_token_fallback`.
     pub github_token: Option<String>,
     /// Optional GitHub account/username to source a token from the local `gh` CLI when
-    /// [`github_token`] is unset. When `Some`, the updater runs `gh auth token --user
+    /// `github_token` is unset. When `Some`, the updater runs `gh auth token --user
     /// <account>` to obtain a token (useful for selecting one of several logged-in `gh`
     /// accounts, e.g. to reach a private release repo).
     pub gh_account: Option<String>,
-    /// When `true` and [`github_token`] is unset, fall back to `gh auth token` (honoring
-    /// [`gh_account`] if set) to source a token from the local `gh` CLI. Defaults to
+    /// When `true` and `github_token` is unset, fall back to `gh auth token` (honoring
+    /// `gh_account` if set) to source a token from the local `gh` CLI. Defaults to
     /// `false` so public-repo callers never shell out to `gh`.
     pub gh_token_fallback: bool,
     /// HTTP request timeout. Defaults to 60 seconds.
@@ -130,6 +131,9 @@ impl std::fmt::Debug for UpdaterConfig {
 }
 
 impl UpdaterConfig {
+    /// Create a config for `tool_name` (the on-disk binary name), the running
+    /// `current_version`, and the GitHub `owner/repo` release slug, with all
+    /// optional overrides left at their defaults.
     pub fn new(
         tool_name: impl Into<String>,
         current_version: impl Into<String>,
@@ -151,6 +155,8 @@ impl UpdaterConfig {
         }
     }
 
+    /// Resolve the install directory: the explicit `install_dir` override when
+    /// set, otherwise the default `$HOME/.local/bin`.
     pub fn install_dir(&self) -> Result<PathBuf> {
         if let Some(dir) = &self.install_dir {
             return Ok(dir.clone());
@@ -161,10 +167,12 @@ impl UpdaterConfig {
         Ok(home.join(".local").join("bin"))
     }
 
+    /// Path to the staged next binary, `<install_dir>/<tool>_next`.
     pub fn next_binary_path(&self) -> Result<PathBuf> {
         Ok(self.install_dir()?.join(format!("{}_next", self.tool_name)))
     }
 
+    /// Path to the installed binary, `<install_dir>/<tool>`.
     pub fn installed_binary_path(&self) -> Result<PathBuf> {
         Ok(self.install_dir()?.join(&self.tool_name))
     }
@@ -253,57 +261,87 @@ impl std::fmt::Debug for AssetStrategy {
     }
 }
 
+/// Resolved release asset names for a given tool/version/target.
 #[derive(Debug, Clone)]
 pub struct AssetNames {
+    /// File name of the release archive (e.g. `tool-1.2.3-x86_64-linux.tar.gz`).
     pub archive: String,
+    /// File name of the sha256 checksum asset for `archive`.
     pub checksum: String,
+    /// Path of the binary inside the unpacked archive.
     pub binary_in_archive: String,
 }
 
+/// Snapshot of the installed/staged state for the host CLI (`<tool> status`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UpdateStatus {
+    /// Tool name as it appears on disk.
     pub tool: String,
+    /// Version of the running binary.
     pub current_version: String,
+    /// Resolved install directory.
     pub install_dir: String,
+    /// Resolved path of the installed binary.
     pub installed_path: String,
+    /// Whether the installed binary currently exists on disk.
     pub installed_exists: bool,
+    /// Resolved path of the staged `<tool>_next` binary.
     pub next_path: String,
+    /// Whether a staged `<tool>_next` binary currently exists on disk.
     pub next_staged: bool,
 }
 
+/// Parsed metadata for the latest GitHub release.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LatestReleaseInfo {
+    /// Raw release tag (e.g. `v1.2.3`).
     pub tag: String,
+    /// Tag with a leading `v` stripped (e.g. `1.2.3`).
     pub version: String,
+    /// Release HTML URL, when present.
     pub html_url: Option<String>,
+    /// Names of the assets attached to the release.
     pub assets: Vec<String>,
+    /// Whether `version` is newer than the configured current version.
     pub newer_than_current: bool,
 }
 
+/// Outcome of a high-level `run_update` call (the `<tool> update` flow).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UpdateOutcome {
+    /// Version of the running binary at the time of the update.
     pub current_version: String,
+    /// Latest version observed on GitHub.
     pub latest_version: String,
+    /// Whether a new binary was staged this run.
     pub staged: bool,
+    /// Whether the staged binary was promoted into place this run.
     pub promoted: bool,
+    /// Resolved path of the staged `<tool>_next` binary.
     pub next_path: String,
+    /// Resolved path of the installed binary.
     pub installed_path: String,
+    /// Optional human-readable note (e.g. "no update needed").
     pub note: Option<String>,
 }
 
+/// Drives the self-update flow for a single configured tool.
 pub struct Updater {
     config: UpdaterConfig,
 }
 
 impl Updater {
+    /// Create an updater from a fully-built config.
     pub fn new(config: UpdaterConfig) -> Self {
         Self { config }
     }
 
+    /// Borrow the underlying config.
     pub fn config(&self) -> &UpdaterConfig {
         &self.config
     }
 
+    /// Report install/staging status without any network access.
     pub fn current_status(&self) -> Result<UpdateStatus> {
         let install_dir = self.config.install_dir()?;
         let installed = self.config.installed_binary_path()?;
@@ -319,6 +357,8 @@ impl Updater {
         })
     }
 
+    /// Query the GitHub "latest release" endpoint and report its tag, assets,
+    /// and whether it is newer than the configured current version.
     pub fn check_latest(&self) -> Result<LatestReleaseInfo> {
         let url = format!(
             "{}/repos/{}/releases/latest",
@@ -391,6 +431,8 @@ impl Updater {
         }
     }
 
+    /// Download the release archive for `latest`, verify its sha256, and write
+    /// the binary to `<install_dir>/<tool>_next`. Returns the staged path.
     pub fn stage_next(&self, latest: &LatestReleaseInfo) -> Result<PathBuf> {
         let install_dir = self.config.install_dir()?;
         fs::create_dir_all(&install_dir)
@@ -498,6 +540,8 @@ impl Updater {
         Ok(Some(installed))
     }
 
+    /// High-level `<tool> update`: check the latest release and, when newer,
+    /// stage and promote it. A no-op when already up to date.
     pub fn run_update(&self) -> Result<UpdateOutcome> {
         let latest = self.check_latest()?;
         let installed_path = self.config.installed_binary_path()?;
@@ -808,9 +852,11 @@ pub fn register_update_tool<C: Send + Sync + 'static>(
     );
 }
 
+/// Empty argument type for the parameterless MCP update tools.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EmptyArgs {}
 
+/// Error wrapper returned by the MCP update tools (a flattened message string).
 #[derive(Debug, Clone)]
 pub struct UpdateError(pub String);
 
