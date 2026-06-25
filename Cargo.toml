@@ -8,8 +8,9 @@ rust-version = "1.85"
 readme = "README.md"
 repository = "https://github.com/harryaskham/updatable-cli"
 homepage = "https://github.com/harryaskham/updatable-cli"
-keywords = ["cli", "self-update", "github", "mcp"]
-categories = ["command-line-utilities", "development-tools"]
+# Consumed git-only across the CLI suite (the mcp-cli dependency is a git dependency
+# with no crates.io version), so this crate is intentionally not published to crates.io.
+publish = false
 
 [lib]
 path = "src/lib.rs"

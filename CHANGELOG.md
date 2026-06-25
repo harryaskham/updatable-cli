@@ -40,5 +40,9 @@ and will move under the first released version when `0.1.0` is cut.
 - `check_latest` returns actionable errors for the two most common GitHub
   release-polling failures: a clear "no published releases yet" message on HTTP
   404, and a "set a token to raise the limit" hint on HTTP 403/429 rate-limiting.
+- Marked the crate `publish = false`: it is consumed git-only across the CLI
+  suite (the `mcp-cli` dependency is a git dependency without a crates.io
+  version), so it is intentionally not published to crates.io. Removed the
+  crates.io-only `keywords`/`categories` metadata accordingly.
 
 [Unreleased]: https://github.com/harryaskham/updatable-cli/commits/main
