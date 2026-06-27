@@ -59,6 +59,7 @@ Runnable examples live in [`examples/`](examples/):
 
 - `cargo run --example status` — print install/staging status (network-free).
 - `cargo run --example update` — run the full check → stage → promote flow.
+- `cargo run --example private_repo` — configure updates from a private GitHub repo (token sources).
 
 ## Install path contract
 
