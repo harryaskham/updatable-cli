@@ -53,6 +53,13 @@ register_update_tool(&mut router, |_ctx: &Ctx| {
 Call `maybe_apply_staged_update("mytool")` early in `main` to swap any staged
 `<tool>_next` into place and re-exec before the rest of the program runs.
 
+## Examples
+
+Runnable examples live in [`examples/`](examples/):
+
+- `cargo run --example status` — print install/staging status (network-free).
+- `cargo run --example update` — run the full check → stage → promote flow.
+
 ## Install path contract
 
 - Default install dir: `$HOME/.local/bin`.

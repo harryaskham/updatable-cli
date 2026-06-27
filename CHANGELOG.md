@@ -30,6 +30,7 @@ and will move under the first released version when `0.1.0` is cut.
 - Continuous integration workflow (rustfmt, clippy `-D warnings`, `cargo test`).
 - Test coverage: mock-HTTP `check_latest`/`stage_next` happy paths and
   `promote_next` / `maybe_apply_staged_update` integration tests.
+- Runnable examples in `examples/` (`status`, `update`).
 
 ### Changed
 
