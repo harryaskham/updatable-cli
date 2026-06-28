@@ -15,11 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -31,11 +26,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # The azure-ephemeral runners are Nix-based and ship no toolchain on PATH,
+      # so the Rust toolchain comes from the flake devshell (nix develop) rather
+      # than a downloaded rustup toolchain (which would not run under NixOS).
       - name: rustfmt
-        run: cargo fmt --all --check
+        run: nix develop --command cargo fmt --all --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
 
       - name: test
-        run: cargo test
+        run: nix develop --command cargo test
