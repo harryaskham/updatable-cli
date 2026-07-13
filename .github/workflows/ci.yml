@@ -61,5 +61,6 @@ jobs:
       - name: Compile and test all targets
         shell: pwsh
         run: |
-          cargo test --all-targets --locked
-          cargo test --doc --locked
+          # This is a library crate and intentionally does not track Cargo.lock.
+          cargo test --all-targets
+          cargo test --doc
