@@ -27,17 +27,21 @@ and will move under the first released version when `0.1.0` is cut.
   leaks to a signed object-store CDN.
 - Host overrides on `UpdaterConfig`: `api_base`, `download_base`, `install_dir`,
   and `http_timeout`.
-- Continuous integration workflow (rustfmt, clippy `-D warnings`, `cargo test`).
+- Continuous integration workflows for Unix/Nix (rustfmt, clippy `-D warnings`, tests)
+  and native `x86_64-pc-windows-msvc` compile/test coverage.
+- Windows-safe staging support: canonical `x86_64-windows` assets containing `<tool>.exe`,
+  `<tool>.exe` / `<tool>_next.exe` paths, and non-destructive deferred promotion when the
+  existing executable may be locked.
 - Test coverage: mock-HTTP `check_latest`/`stage_next` happy paths and
   `promote_next` / `maybe_apply_staged_update` integration tests.
 - Runnable examples in `examples/` (`status`, `update`, `private_repo`).
 
 ### Changed
 
-- Platform support is now explicitly **Unix-only (Linux/macOS)** in the crate
-  docs and README; the unreachable `#[cfg(not(unix))]` `exec_replace` branch was
-  removed (the crate's unconditional `std::os::unix` use already precluded a
-  non-Unix build).
+- Extended platform support from Unix-only to Linux, macOS, and x86_64 Windows while
+  preserving Unix chmod/atomic-rename/re-exec behavior. Windows uses native `.exe` naming,
+  leaves a verified update staged when the current executable exists, and reports actionable
+  replacement guidance instead of attempting an unsafe in-process overwrite.
 - `check_latest` returns actionable errors for the two most common GitHub
   release-polling failures: a clear "no published releases yet" message on HTTP
   404, and a "set a token to raise the limit" hint on HTTP 403/429 rate-limiting.

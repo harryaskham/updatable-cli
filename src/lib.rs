@@ -16,10 +16,11 @@
 //!
 //! ## Platform support
 //!
-//! This crate targets **Unix only (Linux and macOS)**. It depends on `std::os::unix`
-//! APIs for executable-bit handling and `exec`-style re-spawning, and
-//! [`release_target`] only resolves the `x86_64`/`aarch64` linux/darwin asset targets.
-//! Windows is not supported.
+//! Linux, macOS, and x86_64 Windows are supported. Unix hosts preserve executable bits,
+//! atomically promote `<tool>_next`, and re-exec after startup promotion. Windows uses
+//! `tool.exe` / `tool_next.exe` and the canonical `x86_64-windows` release suffix. Because
+//! Windows may lock a running executable, an update is left safely staged when `tool.exe`
+//! already exists; host installers or launchers should replace it after all tool processes exit.
 //!
 //! ## Example
 //!
@@ -37,8 +38,8 @@
 //! let status = Updater::new(config).current_status()?;
 //! assert_eq!(status.tool, "mytool");
 //! assert_eq!(status.current_version, "1.2.3");
-//! assert!(status.installed_path.ends_with("mytool"));
-//! assert!(status.next_path.ends_with("mytool_next"));
+//! assert!(status.installed_path.contains("mytool"));
+//! assert!(status.next_path.contains("mytool_next"));
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
@@ -67,6 +68,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -155,26 +157,49 @@ impl UpdaterConfig {
         }
     }
 
-    /// Resolve the install directory: the explicit `install_dir` override when
-    /// set, otherwise the default `$HOME/.local/bin`.
+    /// Resolve the install directory: the explicit `install_dir` override when set,
+    /// otherwise `$HOME/.local/bin` on Unix or `%LOCALAPPDATA%/Programs/<tool>` on Windows.
     pub fn install_dir(&self) -> Result<PathBuf> {
         if let Some(dir) = &self.install_dir {
             return Ok(dir.clone());
         }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("HOME is unset; cannot resolve default install dir"))?;
-        Ok(home.join(".local").join("bin"))
+        #[cfg(windows)]
+        {
+            let local_app_data = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("USERPROFILE")
+                        .map(PathBuf::from)
+                        .map(|profile| profile.join("AppData").join("Local"))
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "LOCALAPPDATA and USERPROFILE are unset; cannot resolve default Windows install dir"
+                    )
+                })?;
+            return Ok(local_app_data.join("Programs").join(&self.tool_name));
+        }
+        #[cfg(not(windows))]
+        {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("HOME is unset; cannot resolve default install dir"))?;
+            Ok(home.join(".local").join("bin"))
+        }
     }
 
-    /// Path to the staged next binary, `<install_dir>/<tool>_next`.
+    /// Path to the staged next binary: `<tool>_next` on Unix or `<tool>_next.exe` on Windows.
     pub fn next_binary_path(&self) -> Result<PathBuf> {
-        Ok(self.install_dir()?.join(format!("{}_next", self.tool_name)))
+        Ok(self
+            .install_dir()?
+            .join(staged_executable_file_name(&self.tool_name)))
     }
 
-    /// Path to the installed binary, `<install_dir>/<tool>`.
+    /// Path to the installed binary: `<tool>` on Unix or `<tool>.exe` on Windows.
     pub fn installed_binary_path(&self) -> Result<PathBuf> {
-        Ok(self.install_dir()?.join(&self.tool_name))
+        Ok(self
+            .install_dir()?
+            .join(executable_file_name(&self.tool_name)))
     }
 
     fn user_agent(&self) -> String {
@@ -450,7 +475,10 @@ impl Updater {
                 ),
                 binary_in_archive: format!(
                     "{}-{}-{}/{}",
-                    self.config.tool_name, latest.version, target, self.config.tool_name
+                    self.config.tool_name,
+                    latest.version,
+                    target,
+                    executable_file_name(&self.config.tool_name)
                 ),
             },
             AssetStrategy::Custom(strategy) => {
@@ -524,6 +552,11 @@ impl Updater {
 
     /// Promote `<install>/<tool>_next` to `<install>/<tool>`. Returns the installed path
     /// when a promotion happened, `None` when there was nothing staged.
+    ///
+    /// On Windows, replacing an existing executable is deliberately deferred because the
+    /// running image may be locked. In that case this returns `Ok(None)` and leaves both
+    /// `tool.exe` and the verified `tool_next.exe` untouched; the host should replace the
+    /// executable after all tool processes exit (typically via an installer/bootstrapper).
     pub fn promote_next(&self) -> Result<Option<PathBuf>> {
         let next = self.config.next_binary_path()?;
         if !next.exists() {
@@ -532,6 +565,10 @@ impl Updater {
         let installed = self.config.installed_binary_path()?;
         if let Some(parent) = installed.parent() {
             fs::create_dir_all(parent)?;
+        }
+        #[cfg(windows)]
+        if installed.exists() {
+            return Ok(None);
         }
         set_executable(&next)?;
         fs::rename(&next, &installed)
@@ -562,6 +599,11 @@ impl Updater {
         }
         self.stage_next(&latest)?;
         let promoted = self.promote_next()?;
+        let note = if cfg!(windows) && promoted.is_none() {
+            Some(windows_deferred_promotion_note(&next_path, &installed_path))
+        } else {
+            None
+        };
         Ok(UpdateOutcome {
             current_version: self.config.current_version.clone(),
             latest_version: latest.version.clone(),
@@ -569,7 +611,7 @@ impl Updater {
             promoted: promoted.is_some(),
             next_path: next_path.display().to_string(),
             installed_path: installed_path.display().to_string(),
-            note: None,
+            note,
         })
     }
 
@@ -728,11 +770,20 @@ fn atomic_write(destination: &Path, source: &Path) -> Result<()> {
         fs::File::open(source).with_context(|| format!("open source {}", source.display()))?;
     std::io::copy(&mut src, tmp.as_file_mut())?;
     tmp.flush()?;
+    // Windows rename/persist cannot replace an existing destination. This is only the
+    // disposable staged path, never the installed executable, so removing an older staged
+    // payload before persisting the newly checksum-verified one is safe.
+    #[cfg(windows)]
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("remove older staged update {}", destination.display()))?;
+    }
     tmp.persist(destination)
         .map_err(|err| anyhow!("persist {} failed: {err}", destination.display()))?;
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
@@ -740,11 +791,46 @@ fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Look up the running binary, promote any staged `<tool>_next` next to it, and re-exec.
+#[cfg(not(unix))]
+fn set_executable(path: &Path) -> Result<()> {
+    // Windows has no Unix executable bit. Still stat the path so callers retain the same
+    // missing-file/error contract as Unix without trying to mutate meaningless permissions.
+    fs::metadata(path)?;
+    Ok(())
+}
+
+fn executable_file_name(tool_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool_name}.exe")
+    } else {
+        tool_name.to_string()
+    }
+}
+
+fn staged_executable_file_name(tool_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool_name}_next.exe")
+    } else {
+        format!("{tool_name}_next")
+    }
+}
+
+fn windows_deferred_promotion_note(next: &Path, installed: &Path) -> String {
+    format!(
+        "update staged at {}; Windows cannot safely replace an existing/running executable; \
+         close all tool processes, then replace {} with the staged file (or use the host installer/bootstrapper)",
+        next.display(),
+        installed.display()
+    )
+}
+
+/// Look up the running binary and apply any staged sibling update.
 ///
-/// This mirrors caco's startup hook. Hosts should call this at the very top of `main`.
-/// The function is intentionally best-effort: failures only print warnings and return
-/// `Ok(())` so the rest of the CLI still starts.
+/// Unix hosts promote `<tool>_next` and re-exec. Windows hosts detect
+/// `<tool>_next.exe` but leave it staged, print actionable replacement guidance, and continue:
+/// a running `.exe` may be locked and must never be corrupted by an unsafe in-process swap.
+/// The function is intentionally best-effort on every platform: failures only print warnings
+/// and return `Ok(())` so the rest of the CLI still starts.
 pub fn maybe_apply_staged_update(tool_name: &str) -> Result<()> {
     let current = match std::env::current_exe() {
         Ok(path) => path,
@@ -753,43 +839,58 @@ pub fn maybe_apply_staged_update(tool_name: &str) -> Result<()> {
             return Ok(());
         }
     };
-    let staged_name = format!("{tool_name}_next");
-    let staged = current.with_file_name(&staged_name);
+    let staged = current.with_file_name(staged_executable_file_name(tool_name));
     if !staged.exists() {
         return Ok(());
     }
-    if let Err(error) = set_executable(&staged) {
+    #[cfg(windows)]
+    {
         eprintln!(
-            "warning: staged {tool_name} update {} is not promotable: chmod 0755 failed: {error}",
-            staged.display()
+            "warning: {}",
+            windows_deferred_promotion_note(&staged, &current)
         );
         return Ok(());
     }
-    if let Err(error) = fs::rename(&staged, &current) {
+    #[cfg(unix)]
+    {
+        if let Err(error) = set_executable(&staged) {
+            eprintln!(
+                "warning: staged {tool_name} update {} is not promotable: chmod 0755 failed: {error}",
+                staged.display()
+            );
+            return Ok(());
+        }
+        if let Err(error) = fs::rename(&staged, &current) {
+            eprintln!(
+                "warning: failed to promote staged {tool_name} update {}: {error}",
+                staged.display()
+            );
+            return Ok(());
+        }
+        if let Err(error) = set_executable(&current) {
+            eprintln!(
+                "warning: promoted {tool_name} update {} may not be executable: chmod 0755 failed: {error}",
+                current.display()
+            );
+        }
+        eprintln!("Applied staged {tool_name} update");
+        let exe = current.into_os_string();
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let err = exec_replace(&exe, &args);
+        eprintln!("warning: failed to re-exec after staged {tool_name} update: {err}");
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         eprintln!(
-            "warning: failed to promote staged {tool_name} update {}: {error}",
+            "warning: staged {tool_name} update {} cannot be promoted on this platform",
             staged.display()
         );
-        return Ok(());
+        Ok(())
     }
-    if let Err(error) = set_executable(&current) {
-        eprintln!(
-            "warning: promoted {tool_name} update {} may not be executable: chmod 0755 failed: {error}",
-            current.display()
-        );
-    }
-    eprintln!("Applied staged {tool_name} update");
-    let exe = current.into_os_string();
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let err = exec_replace(&exe, &args);
-    eprintln!("warning: failed to re-exec after staged {tool_name} update: {err}");
-    Ok(())
 }
 
-// This crate is Unix-only (Linux/macOS): it unconditionally relies on
-// `std::os::unix` APIs (`PermissionsExt::set_mode`, `CommandExt::exec`) and
-// `release_target` only maps the linux/darwin asset targets, so there is no
-// non-Unix build to fall back to.
+#[cfg(unix)]
 fn exec_replace(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(program);
@@ -797,20 +898,28 @@ fn exec_replace(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> std::
     cmd.exec()
 }
 
-/// Caco/Tendril-style platform suffix: `<arch>-<os>` (`x86_64-linux`, `aarch64-darwin`, ...).
-pub fn release_target() -> Result<String> {
-    let os = match std::env::consts::OS {
+fn release_target_for(os: &str, arch: &str) -> Result<String> {
+    let os = match os {
         "linux" => "linux",
         "macos" => "darwin",
+        "windows" => "windows",
         other => bail!("unsupported updater OS {other}"),
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch {
         "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        "arm64" => "aarch64",
+        "aarch64" | "arm64" => "aarch64",
         other => bail!("unsupported updater arch {other}"),
     };
+    if os == "windows" && arch != "x86_64" {
+        bail!("unsupported Windows updater arch {arch}; canonical assets use x86_64-windows");
+    }
     Ok(format!("{arch}-{os}"))
+}
+
+/// Caco/Tendril-style platform suffix: `<arch>-<os>`, including the canonical
+/// Windows target `x86_64-windows` used by Ring and other downstream CLIs.
+pub fn release_target() -> Result<String> {
+    release_target_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// MCP tool surface.
@@ -897,6 +1006,16 @@ mod tests {
     }
 
     #[test]
+    fn release_target_uses_canonical_windows_suffix() {
+        assert_eq!(
+            release_target_for("windows", "x86_64").unwrap(),
+            "x86_64-windows"
+        );
+        let error = release_target_for("windows", "aarch64").unwrap_err();
+        assert!(error.to_string().contains("x86_64-windows"));
+    }
+
+    #[test]
     fn sha256_verify_accepts_matching_digest() {
         let bytes = b"hello world";
         let mut hasher = Sha256::new();
@@ -918,8 +1037,16 @@ mod tests {
         config.install_dir = Some(tmp.path().to_path_buf());
         let status = Updater::new(config).current_status().unwrap();
         assert_eq!(status.tool, "toolx");
-        assert!(status.installed_path.ends_with("toolx"));
-        assert!(status.next_path.ends_with("toolx_next"));
+        assert!(
+            status
+                .installed_path
+                .ends_with(&executable_file_name("toolx"))
+        );
+        assert!(
+            status
+                .next_path
+                .ends_with(&staged_executable_file_name("toolx"))
+        );
         assert!(!status.installed_exists);
         assert!(!status.next_staged);
     }
@@ -940,6 +1067,7 @@ mod tests {
         assert!(!updater.config().installed_binary_path().unwrap().exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn promote_next_moves_staged_binary_and_marks_executable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -971,6 +1099,69 @@ mod tests {
 
         // A second promotion with nothing staged is a clean no-op.
         assert!(updater.promote_next().unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_use_exe_names_and_existing_binary_defers_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        let installed = updater.config().installed_binary_path().unwrap();
+        let next = updater.config().next_binary_path().unwrap();
+        assert_eq!(installed.file_name().unwrap(), "toolx.exe");
+        assert_eq!(next.file_name().unwrap(), "toolx_next.exe");
+
+        fs::write(&installed, b"current executable").unwrap();
+        fs::write(&next, b"verified staged executable").unwrap();
+        assert!(
+            updater.promote_next().unwrap().is_none(),
+            "Windows must defer replacing an existing executable"
+        );
+        assert_eq!(fs::read(&installed).unwrap(), b"current executable");
+        assert_eq!(fs::read(&next).unwrap(), b"verified staged executable");
+        let note = windows_deferred_promotion_note(&next, &installed);
+        assert!(note.contains("close all tool processes"));
+        assert!(note.contains(&next.display().to_string()));
+        assert!(note.contains(&installed.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_install_dir_is_local_app_data_programs_tool() {
+        let config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        let install_dir = config.install_dir().unwrap();
+        assert!(install_dir.ends_with(Path::new("Programs").join("toolx")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_write_replaces_only_the_staged_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.exe");
+        let staged = tmp.path().join("toolx_next.exe");
+        fs::write(&source, b"new verified payload").unwrap();
+        fs::write(&staged, b"older staged payload").unwrap();
+
+        atomic_write(&staged, &source).unwrap();
+        assert_eq!(fs::read(staged).unwrap(), b"new verified payload");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_promotes_when_no_installed_binary_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        let next = updater.config().next_binary_path().unwrap();
+        fs::write(&next, b"new executable").unwrap();
+
+        let promoted = updater.promote_next().unwrap().expect("safe first install");
+        assert_eq!(promoted.file_name().unwrap(), "toolx.exe");
+        assert!(!next.exists());
+        assert_eq!(fs::read(promoted).unwrap(), b"new executable");
     }
 
     /// Minimal single-shot HTTP server for offline `check_latest` tests.
@@ -1168,8 +1359,9 @@ mod tests {
         let version = "9.9.9";
         let archive_name = format!("toolx-{version}-{target}.tar.gz");
         let checksum_name = format!("toolx-{version}-{target}.sha256");
-        let binary_in_archive = format!("toolx-{version}-{target}/toolx");
-        let payload = b"#!/bin/sh\necho updated-toolx\n";
+        let binary_in_archive =
+            format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let payload = b"portable updated-toolx payload\n";
 
         // Build a real gzip tarball containing `<tool>-<ver>-<target>/<tool>`.
         let mut tar_buf = Vec::new();
@@ -1217,14 +1409,21 @@ mod tests {
         assert!(outcome.promoted, "staged binary should be promoted");
         assert!(outcome.note.is_none());
 
-        // The promoted binary lands at `<install>/toolx`, executable, with our payload,
-        // and the staged `<install>/toolx_next` is consumed by the promotion.
-        let installed = tmp.path().join("toolx");
+        // The promoted binary lands at the platform-native installed name with our payload,
+        // and the staged path is consumed by the promotion.
+        let installed = tmp.path().join(executable_file_name("toolx"));
         assert!(installed.exists(), "installed binary should exist");
-        assert!(!tmp.path().join("toolx_next").exists());
+        assert!(
+            !tmp.path()
+                .join(staged_executable_file_name("toolx"))
+                .exists()
+        );
         assert_eq!(fs::read(&installed).unwrap(), payload);
-        let mode = fs::metadata(&installed).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "installed binary should be chmod 0755");
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&installed).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "installed binary should be chmod 0755");
+        }
     }
 
     #[test]
@@ -1246,8 +1445,12 @@ mod tests {
             outcome.note.is_some(),
             "no-op should carry an explanatory note"
         );
-        assert!(!tmp.path().join("toolx").exists());
-        assert!(!tmp.path().join("toolx_next").exists());
+        assert!(!tmp.path().join(executable_file_name("toolx")).exists());
+        assert!(
+            !tmp.path()
+                .join(staged_executable_file_name("toolx"))
+                .exists()
+        );
     }
 
     /// Build a gzip tarball containing a single entry at `inner_path`. Returns the
@@ -1300,8 +1503,8 @@ mod tests {
         let version = "9.9.9";
         let archive_name = format!("toolx-{version}-{target}.tar.gz");
         let checksum_name = format!("toolx-{version}-{target}.sha256");
-        let inner = format!("toolx-{version}-{target}/toolx");
-        let tarball = gzip_tar_with_entry(&inner, b"#!/bin/sh\nexit 0\n");
+        let inner = format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let tarball = gzip_tar_with_entry(&inner, b"portable payload\n");
         // Deliberately wrong digest for the archive.
         let bad_checksum = format!("{}  {archive_name}\n", "0".repeat(64)).into_bytes();
         let (base, handle) = spawn_routed_http(vec![
@@ -1325,8 +1528,10 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            !tmp.path().join("toolx_next").exists(),
-            "a checksum mismatch must never stage <tool>_next"
+            !tmp.path()
+                .join(staged_executable_file_name("toolx"))
+                .exists(),
+            "a checksum mismatch must never stage the next binary"
         );
     }
 
@@ -1365,8 +1570,10 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            !tmp.path().join("toolx_next").exists(),
-            "an archive missing the binary must not stage <tool>_next"
+            !tmp.path()
+                .join(staged_executable_file_name("toolx"))
+                .exists(),
+            "an archive missing the binary must not stage the next binary"
         );
     }
 
@@ -1609,8 +1816,9 @@ mod tests {
         let version = "9.9.9";
         let archive_name = format!("toolx-{version}-{target}.tar.gz");
         let checksum_name = format!("toolx-{version}-{target}.sha256");
-        let binary_in_archive = format!("toolx-{version}-{target}/toolx");
-        let tarball = gzip_tar_with_entry(&binary_in_archive, b"#!/bin/sh\nexit 0\n");
+        let binary_in_archive =
+            format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let tarball = gzip_tar_with_entry(&binary_in_archive, b"portable payload\n");
         let mut hasher = Sha256::new();
         hasher.update(&tarball);
         let checksum_body =

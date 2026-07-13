@@ -37,3 +37,29 @@ jobs:
 
       - name: test
         run: nix develop --command cargo test
+
+  windows:
+    name: Windows compile + test
+    # updatable-cli is not yet in collective's self-hosted Windows runner allowlist.
+    # Use the native MSVC GitHub runner now; switch to [self-hosted, windows] once it is.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native MSVC host
+        shell: pwsh
+        run: |
+          rustc -vV
+          if (-not ((rustc -vV) -match "host: x86_64-pc-windows-msvc")) {
+            throw "expected native x86_64-pc-windows-msvc toolchain"
+          }
+
+      - name: Compile and test all targets
+        shell: pwsh
+        run: |
+          cargo test --all-targets --locked
+          cargo test --doc --locked

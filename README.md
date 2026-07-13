@@ -13,7 +13,8 @@ synchronous Rust API (`<tool> update`, `<tool> status`, …) and matching MCP to
 - `Updater::current_status`, `Updater::check_latest`, `Updater::stage_next`,
   `Updater::promote_next`, and `Updater::run_update` for the host CLI.
 - `maybe_apply_staged_update("<tool>")` to swap any staged `<tool>_next` into `<tool>` and
-  re-exec on next launch, mirroring caco's startup hook.
+  re-exec on the next Unix launch. On Windows it detects `tool_next.exe`, leaves the locked
+  current `tool.exe` untouched, and prints actionable deferred-replacement guidance.
 - `register_update_tool` to expose the same surface as MCP tools via `mcp-cli`'s `ToolRouter`.
 
 ## Usage
@@ -31,7 +32,7 @@ let status = updater.current_status()?;
 println!("installed: {}", status.installed_path);
 
 // `mytool update` — checks the latest release, and if newer stages
-// `<tool>_next`, sha256-verifies it, and atomically promotes it.
+// the platform-native next binary, sha256-verifies it, and promotes it when safe.
 let outcome = updater.run_update()?;
 if outcome.promoted {
     println!("updated to {}", outcome.latest_version);
@@ -50,8 +51,10 @@ register_update_tool(&mut router, |_ctx: &Ctx| {
 });
 ```
 
-Call `maybe_apply_staged_update("mytool")` early in `main` to swap any staged
-`<tool>_next` into place and re-exec before the rest of the program runs.
+Call `maybe_apply_staged_update("mytool")` early in `main`. Unix hosts swap any staged
+`<tool>_next` into place and re-exec before the rest of the program runs. Windows hosts
+leave `mytool_next.exe` staged because the running `mytool.exe` may be locked; the hook is
+nonfatal and prints the exact follow-up needed instead of risking corruption.
 
 ## Examples
 
@@ -63,6 +66,8 @@ Runnable examples live in [`examples/`](examples/):
 
 ## Install path contract
 
+### Linux and macOS
+
 - Default install dir: `$HOME/.local/bin`.
 - Staged binary: `$HOME/.local/bin/<tool>_next` (verified via sha256 against the release
   checksum asset).
@@ -70,6 +75,20 @@ Runnable examples live in [`examples/`](examples/):
 
 This is the same shape used by `caco update`. Service modules that prefer the local binary can
 simply prepend `$HOME/.local/bin` to `PATH`.
+
+### Windows
+
+- Default install dir: `%LOCALAPPDATA%\\Programs\\<tool>` (falling back through
+  `%USERPROFILE%\\AppData\\Local` when needed).
+- Current binary: `<tool>.exe`.
+- Verified staged binary: `<tool>_next.exe`.
+
+Windows can lock a running `.exe`, so the updater never removes or overwrites an existing
+`<tool>.exe` in-process. `run_update` returns `staged=true`, `promoted=false`, and an actionable
+`note`; `current_status` continues to expose both paths; and `maybe_apply_staged_update` logs the
+same nonfatal guidance at startup. A downstream installer/bootstrapper should wait for all tool
+processes to exit, replace `<tool>.exe` with `<tool>_next.exe`, then launch the new executable.
+Hosts with their own safe updater may use `stage_next` and perform that final swap themselves.
 
 ## Asset naming
 
@@ -80,14 +99,18 @@ By default the crate expects Tendril-style release assets:
 <tool>-<version>-<target>.sha256
 ```
 
-where `<target>` is `x86_64-linux` / `aarch64-linux` / `aarch64-darwin` / `x86_64-darwin`.
+where `<target>` is `x86_64-linux` / `aarch64-linux` / `aarch64-darwin` /
+`x86_64-darwin` / **`x86_64-windows`**. The Windows archive must contain
+`<tool>-<version>-x86_64-windows/<tool>.exe`; its checksum asset uses the same canonical suffix.
 Custom strategies are supported via `AssetStrategy::Custom`.
 
 ## Platform support
 
-This crate is **Unix-only (Linux and macOS)**. It relies on `std::os::unix` APIs for the
-executable bit and `exec`-style re-spawn, and `release_target()` only resolves the
-`x86_64`/`aarch64` linux/darwin asset targets above. Windows is not supported.
+Linux, macOS, and x86_64 Windows (`x86_64-pc-windows-msvc`) compile and retain the complete
+Updater, status/check/download/checksum, MCP registration, and staging APIs. Unix keeps its
+existing chmod + atomic rename + `exec` behavior. Windows has no executable bit and uses the
+safe deferred-promotion contract above. Other Windows architectures are rejected until a
+canonical release suffix and downstream asset contract are agreed.
 
 ## Host overrides
 
