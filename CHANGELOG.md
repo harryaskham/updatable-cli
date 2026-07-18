@@ -22,9 +22,10 @@ and will move under the first released version when `0.1.0` is cut.
 - `AssetStrategy::TendrilStyle` default plus `AssetStrategy::Custom` for bespoke
   release-asset naming, and `release_target()` for the `<arch>-<os>` suffix.
 - Private-repository support: `with_github_token`, `with_gh_account`, and
-  `with_gh_token_fallback`. The bearer is sent to the GitHub release-metadata and
-  asset hosts but dropped automatically on a cross-host redirect so it never
-  leaks to a signed object-store CDN.
+  `with_gh_token_fallback`. Authenticated downloads use GitHub's release-asset API IDs
+  with the binary media type; the bearer is dropped automatically on a cross-host redirect
+  so it never leaks to a signed object-store CDN. Anonymous public assets continue through
+  their browser download URLs.
 - Host overrides on `UpdaterConfig`: `api_base`, `download_base`, `install_dir`,
   and `http_timeout`.
 - Continuous integration workflows for Unix/Nix (rustfmt, clippy `-D warnings`, tests)

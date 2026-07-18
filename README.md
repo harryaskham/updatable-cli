@@ -121,11 +121,13 @@ canonical release suffix and downstream asset contract are agreed.
   GitHub Enterprise, a release mirror, or an air-gapped host that serves
   `<base>/<owner>/<repo>/releases/download/<tag>/<asset>`.
 - `install_dir` — overrides the default `$HOME/.local/bin`.
-- `github_token` — sent as `Authorization: Bearer <token>` on both the release-metadata
-  request **and** the asset/checksum downloads, so private-repo releases update
-  end-to-end. The bearer is dropped automatically when GitHub redirects the asset to a
-  signed object-store URL on a different host, so the credential is never leaked to the
-  CDN.
+- `github_token` — sent as `Authorization: Bearer <token>` on release-metadata requests.
+  For each authenticated asset/checksum download, the updater uses the asset's numeric ID
+  from the release metadata to call GitHub's `/releases/assets/{asset_id}` API with
+  `Accept: application/octet-stream`. It follows the resulting signed object-store redirect
+  but drops the bearer automatically when the host changes, so the credential is never
+  leaked to the CDN. Anonymous public releases continue to use `browser_download_url` (or
+  the configured `download_base`).
 - `gh_account` — GitHub username to source a token from the local `gh` CLI when
   `github_token` is unset. The updater runs `gh auth token --user <account>`, which is
   handy for selecting one of several logged-in `gh` accounts (e.g. the one with access to

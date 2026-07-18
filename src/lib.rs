@@ -104,8 +104,8 @@ pub struct UpdaterConfig {
     /// Optional User-Agent header. Defaults to `<tool>-updater/<current_version>`.
     pub user_agent: Option<String>,
     /// Optional GitHub token for higher rate limits / private repos. Sent as
-    /// `Authorization: Bearer <token>` on both the release-metadata request and the
-    /// asset/checksum downloads. Takes precedence over `gh_account`/`gh_token_fallback`.
+    /// `Authorization: Bearer <token>` on release-metadata requests and authenticated
+    /// release-asset API requests. Takes precedence over `gh_account`/`gh_token_fallback`.
     pub github_token: Option<String>,
     /// Optional GitHub account/username to source a token from the local `gh` CLI when
     /// `github_token` is unset. When `Some`, the updater runs `gh auth token --user
@@ -316,6 +316,20 @@ pub struct UpdateStatus {
     pub next_staged: bool,
 }
 
+/// Download metadata for one asset attached to a GitHub release.
+///
+/// This metadata is retained by [`LatestReleaseInfo`] so authenticated updates can use
+/// GitHub's release-assets API instead of the public `browser_download_url` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAssetInfo {
+    /// File name of the release asset.
+    pub name: String,
+    /// GitHub's numeric release asset ID, when the metadata endpoint supplied one.
+    pub id: Option<u64>,
+    /// Public browser download URL, when the metadata endpoint supplied one.
+    pub browser_download_url: Option<String>,
+}
+
 /// Parsed metadata for the latest GitHub release.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LatestReleaseInfo {
@@ -327,6 +341,13 @@ pub struct LatestReleaseInfo {
     pub html_url: Option<String>,
     /// Names of the assets attached to the release.
     pub assets: Vec<String>,
+    /// API IDs and browser download URLs for the attached assets.
+    ///
+    /// This transport metadata is intentionally omitted from serialized status/MCP output;
+    /// callers still see the stable asset-name list in [`assets`](Self::assets).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub release_assets: Vec<ReleaseAssetInfo>,
     /// Whether `version` is newer than the configured current version.
     pub newer_than_current: bool,
 }
@@ -425,23 +446,37 @@ impl Updater {
             .get("html_url")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string());
-        let assets = response
+        let release_assets: Vec<ReleaseAssetInfo> = response
             .get("assets")
             .and_then(|value| value.as_array())
             .map(|array| {
                 array
                     .iter()
-                    .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
-                    .map(|value| value.to_string())
+                    .filter_map(|item| {
+                        let name = item.get("name")?.as_str()?.to_string();
+                        Some(ReleaseAssetInfo {
+                            name,
+                            id: item.get("id").and_then(|value| value.as_u64()),
+                            browser_download_url: item
+                                .get("browser_download_url")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
+        let assets = release_assets
+            .iter()
+            .map(|asset| asset.name.clone())
+            .collect();
         let newer_than_current = self.is_newer(&version);
         Ok(LatestReleaseInfo {
             tag,
             version,
             html_url,
             assets,
+            release_assets,
             newer_than_current,
         })
     }
@@ -497,32 +532,24 @@ impl Updater {
                 latest.assets
             );
         }
-        let archive_url = format!(
-            "{}/{}/releases/download/{}/{}",
-            self.config.download_base(),
-            self.config.repo_slug,
-            latest.tag,
-            asset_names.archive
-        );
-        let checksum_url = format!(
-            "{}/{}/releases/download/{}/{}",
-            self.config.download_base(),
-            self.config.repo_slug,
-            latest.tag,
-            asset_names.checksum
-        );
         let token = self.config.resolved_token();
+        let (archive_url, archive_accept) =
+            self.asset_download_request(latest, &asset_names.archive, token.is_some());
+        let (checksum_url, checksum_accept) =
+            self.asset_download_request(latest, &asset_names.checksum, token.is_some());
         let timeout = self.config.http_timeout.unwrap_or(Duration::from_secs(60));
         let archive_bytes = download_bytes(
             &archive_url,
             &self.config.user_agent(),
             token.as_deref(),
+            archive_accept,
             timeout,
         )?;
         let checksum_text = download_text(
             &checksum_url,
             &self.config.user_agent(),
             token.as_deref(),
+            checksum_accept,
             timeout,
         )?;
         verify_sha256(&archive_bytes, &checksum_text, &asset_names.archive)?;
@@ -615,6 +642,49 @@ impl Updater {
         })
     }
 
+    fn asset_download_request(
+        &self,
+        latest: &LatestReleaseInfo,
+        asset_name: &str,
+        authenticated: bool,
+    ) -> (String, Option<&'static str>) {
+        let metadata = latest
+            .release_assets
+            .iter()
+            .find(|asset| asset.name == asset_name);
+        if authenticated {
+            if let Some(asset_id) = metadata.and_then(|asset| asset.id) {
+                return (
+                    format!(
+                        "{}/repos/{}/releases/assets/{asset_id}",
+                        self.config.api_base(),
+                        self.config.repo_slug
+                    ),
+                    Some("application/octet-stream"),
+                );
+            }
+        }
+
+        // An explicit download-base override retains the existing mirror/air-gapped
+        // contract. Otherwise prefer GitHub's browser URL and fall back to deriving it
+        // for old fixtures or non-GitHub metadata that only includes asset names.
+        let browser_url = if self.config.download_base.is_some() {
+            None
+        } else {
+            metadata.and_then(|asset| asset.browser_download_url.clone())
+        };
+        let url = browser_url.unwrap_or_else(|| {
+            format!(
+                "{}/{}/releases/download/{}/{}",
+                self.config.download_base(),
+                self.config.repo_slug,
+                latest.tag,
+                asset_name
+            )
+        });
+        (url, None)
+    }
+
     fn http_agent(&self) -> ureq::Agent {
         let timeout = self.config.http_timeout.unwrap_or(Duration::from_secs(60));
         ureq::AgentBuilder::new()
@@ -632,6 +702,7 @@ fn download_bytes(
     url: &str,
     user_agent: &str,
     token: Option<&str>,
+    accept: Option<&str>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     // redirects(0): we follow them ourselves to control credential forwarding.
@@ -645,6 +716,9 @@ fn download_bytes(
     let mut send_auth = token.is_some();
     for _ in 0..10 {
         let mut request = agent.get(&current).set("User-Agent", user_agent);
+        if let Some(accept) = accept {
+            request = request.set("Accept", accept);
+        }
         if send_auth {
             if let Some(token) = token {
                 request = request.set("Authorization", &format!("Bearer {token}"));
@@ -652,6 +726,11 @@ fn download_bytes(
         }
         let response = match request.call() {
             Ok(response) => response,
+            Err(ureq::Error::Status(404, _)) if token.is_none() => {
+                bail!(
+                    "GET {current} returned HTTP 404; GitHub returns 404 for unauthenticated private release assets; configure a token with UpdaterConfig::with_github_token, with_gh_account, or with_gh_token_fallback"
+                );
+            }
             Err(ureq::Error::Status(code, _)) => {
                 bail!("GET {current} returned HTTP {code}");
             }
@@ -682,9 +761,10 @@ fn download_text(
     url: &str,
     user_agent: &str,
     token: Option<&str>,
+    accept: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
-    String::from_utf8(download_bytes(url, user_agent, token, timeout)?)
+    String::from_utf8(download_bytes(url, user_agent, token, accept, timeout)?)
         .map_err(|err| anyhow!("checksum was not UTF-8: {err}"))
 }
 
@@ -1198,8 +1278,16 @@ mod tests {
             "tag_name": "v9.9.9",
             "html_url": "https://example.invalid/releases/v9.9.9",
             "assets": [
-                {"name": "toolx-9.9.9-x86_64-linux.tar.gz"},
-                {"name": "toolx-9.9.9-x86_64-linux.sha256"}
+                {
+                    "id": 101,
+                    "name": "toolx-9.9.9-x86_64-linux.tar.gz",
+                    "browser_download_url": "https://example.invalid/download/archive"
+                },
+                {
+                    "id": 102,
+                    "name": "toolx-9.9.9-x86_64-linux.sha256",
+                    "browser_download_url": "https://example.invalid/download/checksum"
+                }
             ]
         }"#
         .to_string();
@@ -1221,6 +1309,25 @@ mod tests {
             vec![
                 "toolx-9.9.9-x86_64-linux.tar.gz".to_string(),
                 "toolx-9.9.9-x86_64-linux.sha256".to_string(),
+            ]
+        );
+        assert_eq!(
+            info.release_assets,
+            vec![
+                ReleaseAssetInfo {
+                    name: "toolx-9.9.9-x86_64-linux.tar.gz".to_string(),
+                    id: Some(101),
+                    browser_download_url: Some(
+                        "https://example.invalid/download/archive".to_string()
+                    ),
+                },
+                ReleaseAssetInfo {
+                    name: "toolx-9.9.9-x86_64-linux.sha256".to_string(),
+                    id: Some(102),
+                    browser_download_url: Some(
+                        "https://example.invalid/download/checksum".to_string()
+                    ),
+                },
             ]
         );
         assert!(info.newer_than_current, "9.9.9 should be newer than 0.1.0");
@@ -1483,6 +1590,7 @@ mod tests {
             version: "9.9.9".to_string(),
             html_url: None,
             assets: vec!["some-unrelated-asset.txt".to_string()],
+            release_assets: Vec::new(),
             newer_than_current: true,
         };
         let err = updater.stage_next(&latest).unwrap_err();
@@ -1519,6 +1627,7 @@ mod tests {
             version: version.to_string(),
             html_url: None,
             assets: vec![archive_name, checksum_name],
+            release_assets: Vec::new(),
             newer_than_current: true,
         };
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
@@ -1561,6 +1670,7 @@ mod tests {
             version: version.to_string(),
             html_url: None,
             assets: vec![archive_name, checksum_name],
+            release_assets: Vec::new(),
             newer_than_current: true,
         };
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
@@ -1670,22 +1780,24 @@ mod tests {
     enum MockReply {
         Body(Vec<u8>),
         Redirect(String),
+        Status(&'static str, Vec<u8>),
     }
 
-    type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+    type RequestLog =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>>;
 
     /// Like `spawn_routed_http`, but also records each request's first line and its
     /// `Authorization` header (if any), and can answer with a 302 redirect. Used to
     /// assert credential forwarding behaviour without external network.
     fn spawn_recording_http(
         routes: Vec<(&'static str, MockReply)>,
-    ) -> (String, AuthLog, std::thread::JoinHandle<()>) {
+    ) -> (String, RequestLog, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
         let base = format!("http://{addr}");
-        let log: AuthLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log: RequestLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log_thread = log.clone();
         let count = routes.len();
         let handle = std::thread::spawn(move || {
@@ -1698,15 +1810,22 @@ mod tests {
                 let read = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
                 let request_line = request.lines().next().unwrap_or("").to_string();
-                let authorization = request
-                    .lines()
-                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-                    .and_then(|line| line.split_once(':'))
-                    .map(|(_, value)| value.trim().to_string());
+                let header = |name: &str| {
+                    request
+                        .lines()
+                        .find(|line| {
+                            line.split_once(':')
+                                .is_some_and(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                        })
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, value)| value.trim().to_string())
+                };
+                let authorization = header("authorization");
+                let accept = header("accept");
                 log_thread
                     .lock()
                     .unwrap()
-                    .push((request_line.clone(), authorization));
+                    .push((request_line.clone(), authorization, accept));
                 let reply = routes
                     .iter()
                     .find(|(needle, _)| request_line.contains(needle))
@@ -1726,6 +1845,15 @@ mod tests {
                         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                     .into_bytes(),
+                    MockReply::Status(status_line, body) => {
+                        let mut bytes = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        bytes.extend_from_slice(&body);
+                        bytes
+                    }
                 };
                 let _ = stream.write_all(&response);
                 let _ = stream.flush();
@@ -1758,8 +1886,14 @@ mod tests {
         let (base, log, handle) =
             spawn_recording_http(vec![("asset", MockReply::Body(b"payload".to_vec()))]);
         let url = format!("{base}/asset");
-        let bytes =
-            download_bytes(&url, "ua/1.0", Some("secret-xyz"), Duration::from_secs(5)).unwrap();
+        let bytes = download_bytes(
+            &url,
+            "ua/1.0",
+            Some("secret-xyz"),
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
         handle.join().unwrap();
         assert_eq!(bytes, b"payload");
         let recorded = log.lock().unwrap();
@@ -1770,7 +1904,7 @@ mod tests {
         let (base, log, handle) =
             spawn_recording_http(vec![("asset", MockReply::Body(b"payload".to_vec()))]);
         let url = format!("{base}/asset");
-        let bytes = download_bytes(&url, "ua/1.0", None, Duration::from_secs(5)).unwrap();
+        let bytes = download_bytes(&url, "ua/1.0", None, None, Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
         assert_eq!(bytes, b"payload");
         assert_eq!(log.lock().unwrap()[0].1, None);
@@ -1787,8 +1921,14 @@ mod tests {
         )]);
 
         let url = format!("{base_a}/archive");
-        let bytes =
-            download_bytes(&url, "ua/1.0", Some("secret-xyz"), Duration::from_secs(5)).unwrap();
+        let bytes = download_bytes(
+            &url,
+            "ua/1.0",
+            Some("secret-xyz"),
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
         handle_a.join().unwrap();
         handle_b.join().unwrap();
 
@@ -1810,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn run_update_attaches_token_to_metadata_and_asset_downloads() {
+    fn private_update_uses_asset_api_ids_and_strips_auth_on_signed_redirect() {
         let tmp = tempfile::tempdir().unwrap();
         let target = release_target().unwrap();
         let version = "9.9.9";
@@ -1818,43 +1958,173 @@ mod tests {
         let checksum_name = format!("toolx-{version}-{target}.sha256");
         let binary_in_archive =
             format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
-        let tarball = gzip_tar_with_entry(&binary_in_archive, b"portable payload\n");
+        let payload = b"private portable payload\n";
+        let tarball = gzip_tar_with_entry(&binary_in_archive, payload);
         let mut hasher = Sha256::new();
         hasher.update(&tarball);
         let checksum_body =
             format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
         let api_body = format!(
-            r#"{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}"#
+            r#"{{"tag_name":"v{version}","assets":[{{"id":1001,"name":"{archive_name}","browser_download_url":"https://github.invalid/browser-archive"}},{{"id":1002,"name":"{checksum_name}","browser_download_url":"https://github.invalid/browser-checksum"}}]}}"#
         )
         .into_bytes();
 
-        let (base, log, handle) = spawn_recording_http(vec![
+        let (signed_base, signed_log, signed_handle) =
+            spawn_recording_http(vec![("signed-archive", MockReply::Body(tarball))]);
+        let (api_base, api_log, api_handle) = spawn_recording_http(vec![
             ("releases/latest", MockReply::Body(api_body)),
-            (archive_name.clone().leak(), MockReply::Body(tarball)),
-            (checksum_name.clone().leak(), MockReply::Body(checksum_body)),
+            (
+                "/releases/assets/1001",
+                MockReply::Redirect(format!("{signed_base}/signed-archive?signature=opaque")),
+            ),
+            ("/releases/assets/1002", MockReply::Body(checksum_body)),
         ]);
         let mut config =
             UpdaterConfig::new("toolx", "0.1.0", "octocat/example").with_github_token("secret-xyz");
         config.install_dir = Some(tmp.path().to_path_buf());
-        config.api_base = Some(base.clone());
-        config.download_base = Some(base);
+        config.api_base = Some(api_base);
         let outcome = Updater::new(config)
             .run_update()
-            .expect("run_update succeeds");
-        handle.join().unwrap();
+            .expect("private run_update succeeds");
+        api_handle.join().unwrap();
+        signed_handle.join().unwrap();
 
-        assert!(
-            outcome.promoted,
-            "a newer private release should be promoted"
+        assert!(outcome.promoted, "the private release should be promoted");
+        assert_eq!(
+            fs::read(tmp.path().join(executable_file_name("toolx"))).unwrap(),
+            payload
         );
-        let recorded = log.lock().unwrap();
-        assert_eq!(recorded.len(), 3, "metadata + archive + checksum");
-        for (line, authorization) in recorded.iter() {
+
+        let api_requests = api_log.lock().unwrap();
+        assert_eq!(
+            api_requests.len(),
+            3,
+            "metadata + archive API + checksum API"
+        );
+        assert!(
+            api_requests[1]
+                .0
+                .contains("/repos/octocat/example/releases/assets/1001")
+        );
+        assert!(
+            api_requests[2]
+                .0
+                .contains("/repos/octocat/example/releases/assets/1002")
+        );
+        for (line, authorization, accept) in api_requests.iter() {
             assert_eq!(
                 authorization.as_deref(),
                 Some("Bearer secret-xyz"),
                 "request {line:?} should carry the bearer token"
             );
+            if line.contains("/releases/assets/") {
+                assert_eq!(
+                    accept.as_deref(),
+                    Some("application/octet-stream"),
+                    "asset API request {line:?} needs the binary media type"
+                );
+            }
         }
+
+        let signed_requests = signed_log.lock().unwrap();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(
+            signed_requests[0].1, None,
+            "the bearer must not reach the cross-origin signed URL"
+        );
+    }
+
+    #[test]
+    fn public_update_uses_browser_download_urls_without_authentication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let binary_in_archive =
+            format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let tarball = gzip_tar_with_entry(&binary_in_archive, b"public portable payload\n");
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let checksum_body =
+            format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
+
+        let (download_base, download_log, download_handle) = spawn_recording_http(vec![
+            ("/public/archive", MockReply::Body(tarball)),
+            ("/public/checksum", MockReply::Body(checksum_body)),
+        ]);
+        let api_body = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"id":2001,"name":"{archive_name}","browser_download_url":"{download_base}/public/archive"}},{{"id":2002,"name":"{checksum_name}","browser_download_url":"{download_base}/public/checksum"}}]}}"#
+        )
+        .into_bytes();
+        let (api_base, api_log, api_handle) =
+            spawn_recording_http(vec![("releases/latest", MockReply::Body(api_body))]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(api_base);
+        config.http_timeout = Some(Duration::from_secs(5));
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("public run_update succeeds");
+        api_handle.join().unwrap();
+        download_handle.join().unwrap();
+
+        assert!(outcome.promoted);
+        assert_eq!(api_log.lock().unwrap()[0].1, None);
+        let requests = download_log.lock().unwrap();
+        assert_eq!(requests.len(), 2, "archive + checksum browser URLs");
+        assert!(requests[0].0.contains("/public/archive"));
+        assert!(requests[1].0.contains("/public/checksum"));
+        for (line, authorization, accept) in requests.iter() {
+            assert_eq!(
+                authorization, &None,
+                "public request {line:?} must be anonymous"
+            );
+            assert_ne!(
+                accept.as_deref(),
+                Some("application/octet-stream"),
+                "public browser URL {line:?} must retain browser-download behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_asset_404_suggests_private_release_authentication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let version = "9.9.9";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let (download_base, _download_log, download_handle) = spawn_recording_http(vec![(
+            "/private/archive",
+            MockReply::Status("404 Not Found", br#"{"message":"Not Found"}"#.to_vec()),
+        )]);
+        let api_body = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"id":3001,"name":"{archive_name}","browser_download_url":"{download_base}/private/archive"}},{{"id":3002,"name":"{checksum_name}","browser_download_url":"{download_base}/private/checksum"}}]}}"#
+        )
+        .into_bytes();
+        let (api_base, _api_log, api_handle) =
+            spawn_recording_http(vec![("releases/latest", MockReply::Body(api_body))]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(api_base);
+        let error = Updater::new(config)
+            .run_update()
+            .expect_err("an anonymous private asset must fail");
+        api_handle.join().unwrap();
+        download_handle.join().unwrap();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("HTTP 404"), "unexpected error: {message}");
+        assert!(
+            message.contains("private release"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("with_github_token"),
+            "missing authentication guidance: {message}"
+        );
     }
 }
