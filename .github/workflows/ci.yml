@@ -11,7 +11,14 @@ env:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: [self-hosted, azure-ephemeral]
+    # These labels must match runners actually registered on this repo. Targeting a label no
+    # runner carries does not fail fast: the job queues for 24h and is then cancelled, which
+    # reads as an infrastructure flake rather than "nothing can run this" (bd-a5b044 — the
+    # previous `azure-ephemeral` target left the Unix lane dark from 2026-07-13 to 2026-07-30
+    # while eight idle nix runners were online — seven Linux, one macOS). Verify with:
+    #   gh api repos/harryaskham/updatable-cli/actions/runners --jq '.runners[].labels[].name'
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -26,13 +33,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # The azure-ephemeral runners are Nix-based and ship no toolchain on PATH,
-      # so the Rust toolchain comes from the flake devshell (nix develop) rather
-      # than a downloaded rustup toolchain (which would not run under NixOS).
+      # The self-hosted nix runners ship no Rust toolchain on PATH, so the toolchain comes
+      # from the flake devshell (nix develop) rather than a downloaded rustup toolchain
+      # (which would not run under NixOS).
       - name: rustfmt
         run: nix develop --command cargo fmt --all --check
 
       - name: clippy
+        # --all-targets also gives this repo its only Linux COMPILATION: the windows job
+        # builds x86_64-pc-windows-msvc, so every #[cfg(unix)] block — set_executable's chmod
+        # arm, exec_replace, the maybe_apply_staged_update re-exec, install_dir's HOME branch —
+        # is fed to a compiler only here.
         run: nix develop --command cargo clippy --all-targets -- -D warnings
 
       - name: test
