@@ -4,7 +4,9 @@
 //! to stage it, and which tool/version to advertise. From there it gets:
 //!
 //! - [`Updater::current_status`] for `<tool> status`-style reporting.
-//! - [`Updater::check_latest`] for polling the GitHub release latest endpoint.
+//! - [`Updater::check_latest`] for resolving the newest release that carries assets for the
+//!   running platform (multi-platform releases do not publish atomically, so this walks the
+//!   releases feed newest-first within a bounded lookback instead of trusting one tag).
 //! - [`Updater::stage_next`] to download a new binary into `<install_dir>/<tool>_next` after
 //!   verifying its sha256, mirroring caco's `caco_next` staging contract.
 //! - [`Updater::promote_next`] to atomically rename the staged binary to `<install_dir>/<tool>`.
@@ -81,6 +83,12 @@ use sha2::{Digest, Sha256};
 
 pub mod mcp;
 
+/// Default number of releases inspected, newest first, when resolving the newest release
+/// that carries assets for the running platform.
+///
+/// See [`UpdaterConfig::release_lookback`].
+pub const DEFAULT_RELEASE_LOOKBACK: usize = 10;
+
 /// Description of a GitHub-released CLI binary that can self-update itself.
 #[derive(Clone)]
 pub struct UpdaterConfig {
@@ -118,6 +126,15 @@ pub struct UpdaterConfig {
     pub gh_token_fallback: bool,
     /// HTTP request timeout. Defaults to 60 seconds.
     pub http_timeout: Option<Duration>,
+    /// How many releases to inspect, newest first, when resolving the newest release that
+    /// actually carries assets for the running platform. Defaults to
+    /// [`DEFAULT_RELEASE_LOOKBACK`] and is clamped to `1..=100` (GitHub's page limit).
+    ///
+    /// Multi-platform releases do not publish atomically: the newest tag can be missing
+    /// this platform's asset while an older tag has it. The lookback bounds how far back
+    /// the updater is willing to fall back before declaring the platform's release
+    /// pipeline broken.
+    pub release_lookback: Option<usize>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -154,7 +171,23 @@ impl UpdaterConfig {
             gh_account: None,
             gh_token_fallback: false,
             http_timeout: None,
+            release_lookback: None,
         }
+    }
+
+    /// Number of releases inspected when resolving a platform-complete release,
+    /// clamped to `1..=100`.
+    pub fn release_lookback(&self) -> usize {
+        self.release_lookback
+            .unwrap_or(DEFAULT_RELEASE_LOOKBACK)
+            .clamp(1, 100)
+    }
+
+    /// Set how many releases to inspect, newest first, when looking for one that carries
+    /// assets for the running platform (chainable). Clamped to `1..=100`.
+    pub fn with_release_lookback(mut self, releases: usize) -> Self {
+        self.release_lookback = Some(releases);
+        self
     }
 
     /// Resolve the install directory: the explicit `install_dir` override when set,
@@ -330,7 +363,25 @@ pub struct ReleaseAssetInfo {
     pub browser_download_url: Option<String>,
 }
 
-/// Parsed metadata for the latest GitHub release.
+/// A newer release that was skipped because it does not carry the assets this platform
+/// needs (a release that is still publishing, or whose build for this platform failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedRelease {
+    /// Raw release tag (e.g. `v1.2.3`).
+    pub tag: String,
+    /// Tag with a leading `v` stripped (e.g. `1.2.3`).
+    pub version: String,
+    /// Asset names this platform needed but the release does not publish.
+    pub missing_assets: Vec<String>,
+}
+
+/// Parsed metadata for the release this platform should update to.
+///
+/// This is the newest published release that actually carries the assets for the running
+/// platform — not necessarily the newest release overall. Multi-platform releases do not
+/// publish atomically, so the newest tag is routinely missing some platform's build;
+/// [`skipped_newer`](Self::skipped_newer) records exactly which newer releases were passed
+/// over and why.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LatestReleaseInfo {
     /// Raw release tag (e.g. `v1.2.3`).
@@ -350,6 +401,14 @@ pub struct LatestReleaseInfo {
     pub release_assets: Vec<ReleaseAssetInfo>,
     /// Whether `version` is newer than the configured current version.
     pub newer_than_current: bool,
+    /// Releases newer than this one that were skipped because they publish no assets for
+    /// the running platform, newest first.
+    #[serde(default)]
+    pub skipped_newer: Vec<SkippedRelease>,
+    /// Human-readable explanation when a newer release was passed over, e.g.
+    /// `"v0.0.42 has no x86_64-linux release asset; selecting v0.0.41 instead"`.
+    #[serde(default)]
+    pub selection_note: Option<String>,
 }
 
 /// Outcome of a high-level `run_update` call (the `<tool> update` flow).
@@ -403,16 +462,53 @@ impl Updater {
         })
     }
 
-    /// Query the GitHub "latest release" endpoint and report its tag, assets,
-    /// and whether it is newer than the configured current version.
+    /// Resolve the release this platform should update to: the newest published release
+    /// that actually carries assets for the running platform.
+    ///
+    /// Multi-platform releases do not publish atomically — per-platform jobs finish at
+    /// different times and can fail or be starved independently — so the newest tag is
+    /// routinely missing some platform's build. Resolving against "newest release" alone
+    /// blocks those platforms from updating at all while a perfectly good build sits one
+    /// tag back. This walks the releases feed newest first, within the bounded
+    /// [`UpdaterConfig::release_lookback`] window, and returns the first release whose
+    /// archive and checksum assets for this platform are both present.
+    ///
+    /// Any newer releases that were passed over are reported in
+    /// [`LatestReleaseInfo::skipped_newer`] and summarized in
+    /// [`LatestReleaseInfo::selection_note`], so falling back is never silent. When no
+    /// release inside the lookback window carries this platform's assets, that is a real
+    /// failure (the platform's release pipeline is broken) and it is reported as such.
+    ///
+    /// Draft and prerelease entries are ignored, matching GitHub's "latest release"
+    /// semantics.
     pub fn check_latest(&self) -> Result<LatestReleaseInfo> {
+        let target = release_target()?;
+        let releases = self.fetch_releases()?;
+        self.select_release(&target, releases)
+    }
+
+    /// Fetch the newest `release_lookback` releases, newest first, as parsed candidates.
+    fn fetch_releases(&self) -> Result<Vec<ParsedRelease>> {
         let url = format!(
-            "{}/repos/{}/releases/latest",
+            "{}/repos/{}/releases?per_page={}",
             self.config.api_base(),
-            self.config.repo_slug
+            self.config.repo_slug,
+            self.config.release_lookback()
         );
+        let body = self.get_release_json(&url)?;
+        // A single-release object is accepted too, so hosts pointing `api_base` at a
+        // minimal mirror that only serves one release keep working.
+        let entries: Vec<&serde_json::Value> = match body.as_array() {
+            Some(array) => array.iter().collect(),
+            None => vec![&body],
+        };
+        entries.into_iter().map(parse_release).collect()
+    }
+
+    /// GET `url` as JSON with the shared GitHub auth headers and error mapping.
+    fn get_release_json(&self, url: &str) -> Result<serde_json::Value> {
         let agent = self.http_agent();
-        let mut request = agent.get(&url).set("User-Agent", &self.config.user_agent());
+        let mut request = agent.get(url).set("User-Agent", &self.config.user_agent());
         if let Some(token) = self.config.resolved_token() {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
@@ -434,50 +530,95 @@ impl Updater {
                 bail!("GET {url} returned HTTP {code}");
             }
             Err(err) => return Err(anyhow!("GET {url}: {err}")),
-        }
-        .into_json::<serde_json::Value>()?;
-        let tag = response
-            .get("tag_name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("github release missing tag_name"))?
-            .to_string();
-        let version = tag.trim_start_matches('v').to_string();
-        let html_url = response
-            .get("html_url")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string());
-        let release_assets: Vec<ReleaseAssetInfo> = response
-            .get("assets")
-            .and_then(|value| value.as_array())
-            .map(|array| {
-                array
-                    .iter()
-                    .filter_map(|item| {
-                        let name = item.get("name")?.as_str()?.to_string();
-                        Some(ReleaseAssetInfo {
-                            name,
-                            id: item.get("id").and_then(|value| value.as_u64()),
-                            browser_download_url: item
-                                .get("browser_download_url")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let assets = release_assets
-            .iter()
-            .map(|asset| asset.name.clone())
+        };
+        Ok(response.into_json::<serde_json::Value>()?)
+    }
+
+    /// Pick the newest candidate release carrying every asset this platform needs.
+    fn select_release(
+        &self,
+        target: &str,
+        candidates: Vec<ParsedRelease>,
+    ) -> Result<LatestReleaseInfo> {
+        let mut candidates: Vec<ParsedRelease> = candidates
+            .into_iter()
+            .filter(|release| !release.draft && !release.prerelease)
             .collect();
-        let newer_than_current = self.is_newer(&version);
-        Ok(LatestReleaseInfo {
-            tag,
-            version,
-            html_url,
-            assets,
-            release_assets,
-            newer_than_current,
+        if candidates.is_empty() {
+            bail!(
+                "no published GitHub releases for {} yet (drafts and prereleases are ignored)",
+                self.config.repo_slug
+            );
+        }
+        // Newest first. `sort_by` is stable, so releases whose tags do not parse as semver
+        // keep the order GitHub returned them in (already newest-first by creation).
+        candidates.sort_by(|a, b| {
+            semver::Version::parse(&b.version)
+                .ok()
+                .cmp(&semver::Version::parse(&a.version).ok())
+        });
+
+        let mut skipped: Vec<SkippedRelease> = Vec::new();
+        for candidate in &candidates {
+            let names = self.asset_names_for(&candidate.version, target)?;
+            let missing_assets: Vec<String> = [names.archive, names.checksum]
+                .into_iter()
+                .filter(|name| !candidate.assets.iter().any(|asset| &asset.name == name))
+                .collect();
+            if !missing_assets.is_empty() {
+                skipped.push(SkippedRelease {
+                    tag: candidate.tag.clone(),
+                    version: candidate.version.clone(),
+                    missing_assets,
+                });
+                continue;
+            }
+            let selection_note = platform_fallback_note(&skipped, target, &candidate.tag);
+            let newer_than_current = self.is_newer(&candidate.version);
+            return Ok(LatestReleaseInfo {
+                tag: candidate.tag.clone(),
+                version: candidate.version.clone(),
+                html_url: candidate.html_url.clone(),
+                assets: candidate
+                    .assets
+                    .iter()
+                    .map(|asset| asset.name.clone())
+                    .collect(),
+                release_assets: candidate.assets.clone(),
+                newer_than_current,
+                skipped_newer: skipped,
+                selection_note,
+            });
+        }
+
+        // Falling back past every inspected release is a different, more serious condition
+        // than one late tag: this platform's release pipeline is not producing artifacts.
+        let inspected = skipped
+            .iter()
+            .map(|release| release.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "no release of {} within the last {} carries a {target} asset (inspected: {inspected}); \
+             this platform's release pipeline is likely broken",
+            self.config.repo_slug,
+            candidates.len()
+        );
+    }
+
+    /// Resolve the asset names this platform expects for `version`.
+    fn asset_names_for(&self, version: &str, target: &str) -> Result<AssetNames> {
+        Ok(match &self.config.asset_strategy {
+            AssetStrategy::TendrilStyle => AssetNames {
+                archive: format!("{}-{version}-{target}.tar.gz", self.config.tool_name),
+                checksum: format!("{}-{version}-{target}.sha256", self.config.tool_name),
+                binary_in_archive: format!(
+                    "{}-{version}-{target}/{}",
+                    self.config.tool_name,
+                    executable_file_name(&self.config.tool_name)
+                ),
+            },
+            AssetStrategy::Custom(strategy) => strategy(&self.config.tool_name, version, target)?,
         })
     }
 
@@ -498,28 +639,7 @@ impl Updater {
         fs::create_dir_all(&install_dir)
             .with_context(|| format!("create {}", install_dir.display()))?;
         let target = release_target()?;
-        let asset_names = match &self.config.asset_strategy {
-            AssetStrategy::TendrilStyle => AssetNames {
-                archive: format!(
-                    "{}-{}-{}.tar.gz",
-                    self.config.tool_name, latest.version, target
-                ),
-                checksum: format!(
-                    "{}-{}-{}.sha256",
-                    self.config.tool_name, latest.version, target
-                ),
-                binary_in_archive: format!(
-                    "{}-{}-{}/{}",
-                    self.config.tool_name,
-                    latest.version,
-                    target,
-                    executable_file_name(&self.config.tool_name)
-                ),
-            },
-            AssetStrategy::Custom(strategy) => {
-                strategy(&self.config.tool_name, &latest.version, &target)?
-            }
-        };
+        let asset_names = self.asset_names_for(&latest.version, &target)?;
         if !latest
             .assets
             .iter()
@@ -604,13 +724,25 @@ impl Updater {
         Ok(Some(installed))
     }
 
-    /// High-level `<tool> update`: check the latest release and, when newer,
-    /// stage and promote it. A no-op when already up to date.
+    /// High-level `<tool> update`: resolve the newest release carrying this platform's
+    /// assets and, when newer, stage and promote it. A no-op when already up to date.
+    ///
+    /// When a newer release was skipped because it publishes nothing for this platform,
+    /// the returned [`UpdateOutcome::note`] says so explicitly — taking an older release
+    /// silently would be its own problem.
     pub fn run_update(&self) -> Result<UpdateOutcome> {
         let latest = self.check_latest()?;
         let installed_path = self.config.installed_binary_path()?;
         let next_path = self.config.next_binary_path()?;
         if !latest.newer_than_current {
+            let mut note = format!(
+                "no update needed; latest is {} and current is {}",
+                latest.version, self.config.current_version
+            );
+            if let Some(selection) = &latest.selection_note {
+                note.push_str("; ");
+                note.push_str(selection);
+            }
             return Ok(UpdateOutcome {
                 current_version: self.config.current_version.clone(),
                 latest_version: latest.version.clone(),
@@ -618,18 +750,22 @@ impl Updater {
                 promoted: false,
                 next_path: next_path.display().to_string(),
                 installed_path: installed_path.display().to_string(),
-                note: Some(format!(
-                    "no update needed; latest is {} and current is {}",
-                    latest.version, self.config.current_version
-                )),
+                note: Some(note),
             });
         }
         self.stage_next(&latest)?;
         let promoted = self.promote_next()?;
-        let note = if cfg!(windows) && promoted.is_none() {
-            Some(windows_deferred_promotion_note(&next_path, &installed_path))
-        } else {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(selection) = &latest.selection_note {
+            notes.push(selection.clone());
+        }
+        if cfg!(windows) && promoted.is_none() {
+            notes.push(windows_deferred_promotion_note(&next_path, &installed_path));
+        }
+        let note = if notes.is_empty() {
             None
+        } else {
+            Some(notes.join("; "))
         };
         Ok(UpdateOutcome {
             current_version: self.config.current_version.clone(),
@@ -691,6 +827,88 @@ impl Updater {
             .timeout_connect(timeout)
             .timeout_read(timeout)
             .build()
+    }
+}
+
+/// One release parsed out of the GitHub releases feed, before platform selection.
+#[derive(Debug, Clone)]
+struct ParsedRelease {
+    tag: String,
+    version: String,
+    html_url: Option<String>,
+    assets: Vec<ReleaseAssetInfo>,
+    draft: bool,
+    prerelease: bool,
+}
+
+/// Parse one GitHub release JSON object into a [`ParsedRelease`].
+fn parse_release(value: &serde_json::Value) -> Result<ParsedRelease> {
+    let tag = value
+        .get("tag_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("github release missing tag_name"))?
+        .to_string();
+    let version = tag.trim_start_matches('v').to_string();
+    let html_url = value
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let assets: Vec<ReleaseAssetInfo> = value
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| {
+                    let name = item.get("name")?.as_str()?.to_string();
+                    Some(ReleaseAssetInfo {
+                        name,
+                        id: item.get("id").and_then(|value| value.as_u64()),
+                        browser_download_url: item
+                            .get("browser_download_url")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let flag = |key: &str| {
+        value
+            .get(key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    };
+    Ok(ParsedRelease {
+        tag,
+        version,
+        html_url,
+        assets,
+        draft: flag("draft"),
+        prerelease: flag("prerelease"),
+    })
+}
+
+/// Human-readable explanation of a platform fallback, or `None` when the newest release
+/// was usable as-is.
+fn platform_fallback_note(
+    skipped: &[SkippedRelease],
+    target: &str,
+    selected_tag: &str,
+) -> Option<String> {
+    match skipped {
+        [] => None,
+        [one] => Some(format!(
+            "{} has no {target} release asset; selecting {selected_tag} instead",
+            one.tag
+        )),
+        many => Some(format!(
+            "{} have no {target} release assets; selecting {selected_tag} instead",
+            many.iter()
+                .map(|release| release.tag.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -1274,23 +1492,27 @@ mod tests {
 
     #[test]
     fn check_latest_parses_release_and_flags_newer_version() {
-        let body = r#"{
+        let target = release_target().unwrap();
+        let archive = format!("toolx-9.9.9-{target}.tar.gz");
+        let checksum = format!("toolx-9.9.9-{target}.sha256");
+        let body = format!(
+            r#"[{{
             "tag_name": "v9.9.9",
             "html_url": "https://example.invalid/releases/v9.9.9",
             "assets": [
-                {
+                {{
                     "id": 101,
-                    "name": "toolx-9.9.9-x86_64-linux.tar.gz",
+                    "name": "{archive}",
                     "browser_download_url": "https://example.invalid/download/archive"
-                },
-                {
+                }},
+                {{
                     "id": 102,
-                    "name": "toolx-9.9.9-x86_64-linux.sha256",
+                    "name": "{checksum}",
                     "browser_download_url": "https://example.invalid/download/checksum"
-                }
+                }}
             ]
-        }"#
-        .to_string();
+        }}]"#
+        );
         let (base, handle) = spawn_one_shot_http(body);
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.api_base = Some(base);
@@ -1304,25 +1526,19 @@ mod tests {
             info.html_url.as_deref(),
             Some("https://example.invalid/releases/v9.9.9")
         );
-        assert_eq!(
-            info.assets,
-            vec![
-                "toolx-9.9.9-x86_64-linux.tar.gz".to_string(),
-                "toolx-9.9.9-x86_64-linux.sha256".to_string(),
-            ]
-        );
+        assert_eq!(info.assets, vec![archive.clone(), checksum.clone()]);
         assert_eq!(
             info.release_assets,
             vec![
                 ReleaseAssetInfo {
-                    name: "toolx-9.9.9-x86_64-linux.tar.gz".to_string(),
+                    name: archive,
                     id: Some(101),
                     browser_download_url: Some(
                         "https://example.invalid/download/archive".to_string()
                     ),
                 },
                 ReleaseAssetInfo {
-                    name: "toolx-9.9.9-x86_64-linux.sha256".to_string(),
+                    name: checksum,
                     id: Some(102),
                     browser_download_url: Some(
                         "https://example.invalid/download/checksum".to_string()
@@ -1331,11 +1547,41 @@ mod tests {
             ]
         );
         assert!(info.newer_than_current, "9.9.9 should be newer than 0.1.0");
+        assert!(
+            info.skipped_newer.is_empty(),
+            "nothing newer to skip: {:?}",
+            info.skipped_newer
+        );
+        assert!(
+            info.selection_note.is_none(),
+            "the newest release was usable, so there is nothing to explain"
+        );
+    }
+
+    /// A minimal mirror that serves a single release object rather than a feed array is
+    /// still understood (the release just has to carry this platform's assets).
+    #[test]
+    fn check_latest_accepts_a_single_release_object_body() {
+        let target = release_target().unwrap();
+        let body = format!(
+            r#"{{"tag_name":"v9.9.9","assets":[{{"name":"toolx-9.9.9-{target}.tar.gz"}},{{"name":"toolx-9.9.9-{target}.sha256"}}]}}"#
+        );
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("a single-object release body is accepted");
+        handle.join().unwrap();
+        assert_eq!(info.version, "9.9.9");
     }
 
     #[test]
     fn check_latest_reports_not_newer_for_same_version() {
-        let body = r#"{"tag_name": "v0.1.0", "assets": []}"#.to_string();
+        let target = release_target().unwrap();
+        let body = format!(
+            r#"[{{"tag_name":"v0.1.0","assets":[{{"name":"toolx-0.1.0-{target}.tar.gz"}},{{"name":"toolx-0.1.0-{target}.sha256"}}]}}]"#
+        );
         let (base, handle) = spawn_one_shot_http(body);
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.api_base = Some(base);
@@ -1344,7 +1590,6 @@ mod tests {
             .expect("check_latest succeeds");
         handle.join().unwrap();
         assert_eq!(info.version, "0.1.0");
-        assert!(info.assets.is_empty());
         assert!(info.html_url.is_none());
         assert!(
             !info.newer_than_current,
@@ -1490,14 +1735,14 @@ mod tests {
         let checksum_body = format!("{digest}  {archive_name}\n").into_bytes();
 
         let api_body = format!(
-            r#"{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}"#
+            r#"[{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}]"#
         )
         .into_bytes();
 
         // Order matters: check_latest hits the API first, then stage_next downloads
         // the archive and the checksum.
         let (base, handle) = spawn_routed_http(vec![
-            ("releases/latest", api_body),
+            ("releases?", api_body),
             (archive_name.leak(), tar_buf),
             (checksum_name.leak(), checksum_body),
         ]);
@@ -1536,8 +1781,12 @@ mod tests {
     #[test]
     fn run_update_is_noop_when_latest_is_not_newer() {
         let tmp = tempfile::tempdir().unwrap();
-        let api_body = br#"{"tag_name":"v0.1.0","assets":[]}"#.to_vec();
-        let (base, handle) = spawn_routed_http(vec![("releases/latest", api_body)]);
+        let target = release_target().unwrap();
+        let api_body = format!(
+            r#"[{{"tag_name":"v0.1.0","assets":[{{"name":"toolx-0.1.0-{target}.tar.gz"}},{{"name":"toolx-0.1.0-{target}.sha256"}}]}}]"#
+        )
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());
         config.api_base = Some(base.clone());
@@ -1592,6 +1841,8 @@ mod tests {
             assets: vec!["some-unrelated-asset.txt".to_string()],
             release_assets: Vec::new(),
             newer_than_current: true,
+            skipped_newer: Vec::new(),
+            selection_note: None,
         };
         let err = updater.stage_next(&latest).unwrap_err();
         assert!(
@@ -1629,6 +1880,8 @@ mod tests {
             assets: vec![archive_name, checksum_name],
             release_assets: Vec::new(),
             newer_than_current: true,
+            skipped_newer: Vec::new(),
+            selection_note: None,
         };
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
         handle.join().unwrap();
@@ -1672,6 +1925,8 @@ mod tests {
             assets: vec![archive_name, checksum_name],
             release_assets: Vec::new(),
             newer_than_current: true,
+            skipped_newer: Vec::new(),
+            selection_note: None,
         };
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
         handle.join().unwrap();
@@ -1721,6 +1976,247 @@ mod tests {
         assert!(
             updater_at("nightly").is_newer("rolling"),
             "two distinct non-semver tags => treated as newer"
+        );
+    }
+
+    /// Build a releases-feed JSON body from `(tag, asset-suffixes)` pairs, where each
+    /// suffix is a full platform suffix such as `x86_64-linux`.
+    fn releases_feed(entries: &[(&str, &[&str])]) -> String {
+        let releases: Vec<String> = entries
+            .iter()
+            .map(|(tag, targets)| {
+                let version = tag.trim_start_matches('v');
+                let assets: Vec<String> = targets
+                    .iter()
+                    .flat_map(|target| {
+                        [
+                            format!(r#"{{"name":"toolx-{version}-{target}.tar.gz"}}"#),
+                            format!(r#"{{"name":"toolx-{version}-{target}.sha256"}}"#),
+                        ]
+                    })
+                    .collect();
+                format!(r#"{{"tag_name":"{tag}","assets":[{}]}}"#, assets.join(","))
+            })
+            .collect();
+        format!("[{}]", releases.join(","))
+    }
+
+    /// The helsinki case (bd-0497f6): the newest tag published only one platform's build,
+    /// so a node on the other platform must fall back to the newest release that actually
+    /// carries its asset instead of refusing to update at all.
+    #[test]
+    fn check_latest_falls_back_to_newest_release_carrying_this_platform() {
+        let target = release_target().unwrap();
+        let other = if target == "aarch64-darwin" {
+            "x86_64-linux"
+        } else {
+            "aarch64-darwin"
+        };
+        let body = releases_feed(&[
+            ("v0.0.42", &[other]),
+            ("v0.0.41", &[other, &target]),
+            ("v0.0.40", &[&target]),
+        ]);
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.0.27", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("a platform-incomplete newest release must not block the update");
+        handle.join().unwrap();
+
+        assert_eq!(info.tag, "v0.0.41", "newest release carrying {target}");
+        assert!(info.newer_than_current);
+        assert_eq!(
+            info.skipped_newer,
+            vec![SkippedRelease {
+                tag: "v0.0.42".to_string(),
+                version: "0.0.42".to_string(),
+                missing_assets: vec![
+                    format!("toolx-0.0.42-{target}.tar.gz"),
+                    format!("toolx-0.0.42-{target}.sha256"),
+                ],
+            }],
+            "the skipped newer release must be reported, not silently dropped"
+        );
+        let note = info.selection_note.expect("a fallback must be explained");
+        assert!(
+            note.contains("v0.0.42") && note.contains(&target) && note.contains("v0.0.41"),
+            "unexpected note: {note}"
+        );
+    }
+
+    /// A release feed where *no* inspected release carries this platform's asset is a
+    /// different, more serious condition than one late tag: the platform's release
+    /// pipeline is broken, and the error must say so rather than look like a lag.
+    #[test]
+    fn check_latest_errors_when_no_release_in_lookback_carries_platform_assets() {
+        let target = release_target().unwrap();
+        let other = if target == "aarch64-darwin" {
+            "x86_64-linux"
+        } else {
+            "aarch64-darwin"
+        };
+        let body = releases_feed(&[("v0.0.42", &[other]), ("v0.0.41", &[other])]);
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.0.27", "octocat/example");
+        config.api_base = Some(base);
+        let err = Updater::new(config)
+            .check_latest()
+            .expect_err("an entirely missing platform must surface as a real failure");
+        handle.join().unwrap();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&target)
+                && message.contains("v0.0.42")
+                && message.contains("v0.0.41")
+                && message.contains("release pipeline"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// The releases feed includes drafts and prereleases; GitHub's "latest release"
+    /// semantics do not, so neither does the platform-aware resolution.
+    #[test]
+    fn check_latest_ignores_drafts_and_prereleases() {
+        let target = release_target().unwrap();
+        let body = format!(
+            r#"[{{"tag_name":"v9.9.9","draft":true,"assets":[{{"name":"toolx-9.9.9-{target}.tar.gz"}},{{"name":"toolx-9.9.9-{target}.sha256"}}]}},
+                {{"tag_name":"v9.9.8","prerelease":true,"assets":[{{"name":"toolx-9.9.8-{target}.tar.gz"}},{{"name":"toolx-9.9.8-{target}.sha256"}}]}},
+                {{"tag_name":"v9.9.7","assets":[{{"name":"toolx-9.9.7-{target}.tar.gz"}},{{"name":"toolx-9.9.7-{target}.sha256"}}]}}]"#
+        );
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
+        handle.join().unwrap();
+        assert_eq!(info.tag, "v9.9.7");
+        assert!(
+            info.skipped_newer.is_empty(),
+            "drafts/prereleases are filtered out, not reported as platform-incomplete"
+        );
+    }
+
+    /// The search stays bounded: the configured lookback is what the feed request asks
+    /// for, and it is clamped to GitHub's page limit.
+    #[test]
+    fn release_lookback_bounds_the_feed_request() {
+        let target = release_target().unwrap();
+        let body = releases_feed(&[("v9.9.9", &[&target])]).into_bytes();
+        let (base, log, handle) = spawn_recording_http(vec![("releases?", MockReply::Body(body))]);
+        let config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example")
+            .with_release_lookback(3)
+            .with_github_token("");
+        let mut config = config;
+        config.api_base = Some(base);
+        assert_eq!(config.release_lookback(), 3);
+        Updater::new(config).check_latest().expect("succeeds");
+        handle.join().unwrap();
+        let requests = log.lock().unwrap();
+        assert!(
+            requests[0].0.contains("per_page=3"),
+            "unexpected request: {:?}",
+            requests[0].0
+        );
+        // Out-of-range lookbacks are clamped rather than sent verbatim.
+        assert_eq!(
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example")
+                .with_release_lookback(0)
+                .release_lookback(),
+            1
+        );
+        assert_eq!(
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example")
+                .with_release_lookback(5_000)
+                .release_lookback(),
+            100
+        );
+        assert_eq!(
+            UpdaterConfig::new("toolx", "0.1.0", "octocat/example").release_lookback(),
+            DEFAULT_RELEASE_LOOKBACK
+        );
+    }
+
+    /// End-to-end: a platform-incomplete newest release still produces a promoted binary
+    /// from the newest release that has this platform's asset, and `run_update` says so.
+    #[test]
+    fn run_update_installs_the_fallback_release_and_explains_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let other = if target == "aarch64-darwin" {
+            "x86_64-linux"
+        } else {
+            "aarch64-darwin"
+        };
+        let version = "0.0.41";
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let inner = format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let payload = b"fallback release payload\n";
+        let tarball = gzip_tar_with_entry(&inner, payload);
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let checksum_body =
+            format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
+        let api_body =
+            releases_feed(&[("v0.0.42", &[other]), ("v0.0.41", &[&target])]).into_bytes();
+
+        let (base, handle) = spawn_routed_http(vec![
+            ("releases?", api_body),
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.leak(), checksum_body),
+        ]);
+        let mut config = UpdaterConfig::new("toolx", "0.0.27", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update falls back instead of refusing");
+        handle.join().unwrap();
+
+        assert_eq!(outcome.latest_version, version);
+        assert!(outcome.staged && outcome.promoted);
+        let note = outcome
+            .note
+            .expect("installing an older release must never be silent");
+        assert!(
+            note.contains("v0.0.42") && note.contains(&target) && note.contains("v0.0.41"),
+            "unexpected note: {note}"
+        );
+        let installed = tmp.path().join(executable_file_name("toolx"));
+        assert_eq!(fs::read(&installed).unwrap(), payload);
+    }
+
+    /// Already running the newest release this platform has: no update, and the note
+    /// still explains that a newer tag exists but publishes nothing for this platform.
+    #[test]
+    fn run_update_noop_note_explains_a_platform_incomplete_newer_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let other = if target == "aarch64-darwin" {
+            "x86_64-linux"
+        } else {
+            "aarch64-darwin"
+        };
+        let api_body =
+            releases_feed(&[("v0.0.42", &[other]), ("v0.0.41", &[&target])]).into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "0.0.41", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
+        handle.join().unwrap();
+        assert!(!outcome.staged && !outcome.promoted);
+        let note = outcome.note.expect("a no-op should carry a note");
+        assert!(
+            note.contains("no update needed") && note.contains("v0.0.42"),
+            "unexpected note: {note}"
         );
     }
 
@@ -1965,14 +2461,14 @@ mod tests {
         let checksum_body =
             format!("{}  {archive_name}\n", hex::encode(hasher.finalize())).into_bytes();
         let api_body = format!(
-            r#"{{"tag_name":"v{version}","assets":[{{"id":1001,"name":"{archive_name}","browser_download_url":"https://github.invalid/browser-archive"}},{{"id":1002,"name":"{checksum_name}","browser_download_url":"https://github.invalid/browser-checksum"}}]}}"#
+            r#"[{{"tag_name":"v{version}","assets":[{{"id":1001,"name":"{archive_name}","browser_download_url":"https://github.invalid/browser-archive"}},{{"id":1002,"name":"{checksum_name}","browser_download_url":"https://github.invalid/browser-checksum"}}]}}]"#
         )
         .into_bytes();
 
         let (signed_base, signed_log, signed_handle) =
             spawn_recording_http(vec![("signed-archive", MockReply::Body(tarball))]);
         let (api_base, api_log, api_handle) = spawn_recording_http(vec![
-            ("releases/latest", MockReply::Body(api_body)),
+            ("releases?", MockReply::Body(api_body)),
             (
                 "/releases/assets/1001",
                 MockReply::Redirect(format!("{signed_base}/signed-archive?signature=opaque")),
@@ -2054,11 +2550,11 @@ mod tests {
             ("/public/checksum", MockReply::Body(checksum_body)),
         ]);
         let api_body = format!(
-            r#"{{"tag_name":"v{version}","assets":[{{"id":2001,"name":"{archive_name}","browser_download_url":"{download_base}/public/archive"}},{{"id":2002,"name":"{checksum_name}","browser_download_url":"{download_base}/public/checksum"}}]}}"#
+            r#"[{{"tag_name":"v{version}","assets":[{{"id":2001,"name":"{archive_name}","browser_download_url":"{download_base}/public/archive"}},{{"id":2002,"name":"{checksum_name}","browser_download_url":"{download_base}/public/checksum"}}]}}]"#
         )
         .into_bytes();
         let (api_base, api_log, api_handle) =
-            spawn_recording_http(vec![("releases/latest", MockReply::Body(api_body))]);
+            spawn_recording_http(vec![("releases?", MockReply::Body(api_body))]);
 
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());
@@ -2101,11 +2597,11 @@ mod tests {
             MockReply::Status("404 Not Found", br#"{"message":"Not Found"}"#.to_vec()),
         )]);
         let api_body = format!(
-            r#"{{"tag_name":"v{version}","assets":[{{"id":3001,"name":"{archive_name}","browser_download_url":"{download_base}/private/archive"}},{{"id":3002,"name":"{checksum_name}","browser_download_url":"{download_base}/private/checksum"}}]}}"#
+            r#"[{{"tag_name":"v{version}","assets":[{{"id":3001,"name":"{archive_name}","browser_download_url":"{download_base}/private/archive"}},{{"id":3002,"name":"{checksum_name}","browser_download_url":"{download_base}/private/checksum"}}]}}]"#
         )
         .into_bytes();
         let (api_base, _api_log, api_handle) =
-            spawn_recording_http(vec![("releases/latest", MockReply::Body(api_body))]);
+            spawn_recording_http(vec![("releases?", MockReply::Body(api_body))]);
 
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());

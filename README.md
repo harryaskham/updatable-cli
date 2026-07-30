@@ -12,6 +12,9 @@ synchronous Rust API (`<tool> update`, `<tool> status`, …) and matching MCP to
   optional install dir / asset strategy.
 - `Updater::current_status`, `Updater::check_latest`, `Updater::stage_next`,
   `Updater::promote_next`, and `Updater::run_update` for the host CLI.
+- Platform-aware release selection: updates resolve against the newest release that actually
+  carries an asset for the running platform, with a bounded lookback (see
+  [Platform-incomplete releases](#platform-incomplete-releases)).
 - `maybe_apply_staged_update("<tool>")` to swap any staged `<tool>_next` into `<tool>` and
   re-exec on the next Unix launch. On Windows it detects `tool_next.exe`, leaves the locked
   current `tool.exe` untouched, and prints actionable deferred-replacement guidance.
@@ -104,6 +107,38 @@ where `<target>` is `x86_64-linux` / `aarch64-linux` / `aarch64-darwin` /
 `<tool>-<version>-x86_64-windows/<tool>.exe`; its checksum asset uses the same canonical suffix.
 Custom strategies are supported via `AssetStrategy::Custom`.
 
+## Platform-incomplete releases
+
+Multi-platform releases do not publish atomically. Per-platform release jobs finish at
+different times, and some fail or get starved independently, so the newest tag is routinely
+missing one platform's build. Resolving updates against "the newest release" alone means a
+node can be blocked from updating at all while a perfectly good build sits one tag back —
+and it blocks hardest on whichever platform is slowest or flakiest to build.
+
+`check_latest` therefore resolves **the newest release carrying an asset for _this_
+platform**:
+
+- It walks the releases feed newest-first (drafts and prereleases ignored, matching GitHub's
+  "latest release" semantics) and picks the first release whose `<tool>-<version>-<target>`
+  archive **and** checksum are both published.
+- The choice is always explicit. `LatestReleaseInfo::selection_note` and
+  `UpdateOutcome::note` carry e.g. `v0.0.42 has no x86_64-linux release asset; selecting
+  v0.0.41 instead`, and `LatestReleaseInfo::skipped_newer` lists each skipped tag together
+  with the exact asset names it was missing — enough to distinguish "still publishing" from
+  "this platform's build failed". Silently installing an older version would be its own
+  problem.
+- The search is bounded by `UpdaterConfig::release_lookback` (default
+  `DEFAULT_RELEASE_LOOKBACK` = 10, clamped to `1..=100`):
+
+  ```rust,ignore
+  let config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/mytool")
+      .with_release_lookback(25);
+  ```
+
+  If no release inside that window carries this platform's assets, that is a real failure and
+  is reported as one — naming every inspected tag — because the platform's release pipeline
+  is broken, which is a different and more serious condition than one late tag.
+
 ## Platform support
 
 Linux, macOS, and x86_64 Windows (`x86_64-pc-windows-msvc`) compile and retain the complete
@@ -121,6 +156,9 @@ canonical release suffix and downstream asset contract are agreed.
   GitHub Enterprise, a release mirror, or an air-gapped host that serves
   `<base>/<owner>/<repo>/releases/download/<tag>/<asset>`.
 - `install_dir` — overrides the default `$HOME/.local/bin`.
+- `release_lookback` — how many releases to inspect, newest first, when resolving the newest
+  release that carries this platform's assets. Defaults to `DEFAULT_RELEASE_LOOKBACK` (10),
+  clamped to `1..=100`. See [Platform-incomplete releases](#platform-incomplete-releases).
 - `github_token` — sent as `Authorization: Bearer <token>` on release-metadata requests.
   For each authenticated asset/checksum download, the updater uses the asset's numeric ID
   from the release metadata to call GitHub's `/releases/assets/{asset_id}` API with

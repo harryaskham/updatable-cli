@@ -39,6 +39,27 @@ and will move under the first released version when `0.1.0` is cut.
 
 ### Changed
 
+- **Self-update resolves against the newest release that carries assets for the running
+  platform, not the newest release overall** (bd-0497f6). Multi-platform releases do not
+  publish atomically: per-platform jobs finish at different times and can fail or be starved
+  independently, so the newest tag is routinely missing some platform's build. Previously
+  `check_latest`/`run_update` read only `/releases/latest` and refused outright
+  (`release v0.0.42 has no asset tool-0.0.42-x86_64-linux.tar.gz`), which blocked a node from
+  updating at all while a usable build sat one tag back — and it blocked hardest on whichever
+  platform is slowest or flakiest to build. `check_latest` now walks the releases feed
+  newest-first within a bounded lookback and selects the first release whose archive and
+  checksum for this platform are both present. Drafts and prereleases are ignored, as they
+  were under the `latest` endpoint.
+  - The fallback is never silent: `LatestReleaseInfo::selection_note` and
+    `UpdateOutcome::note` report `"v0.0.42 has no x86_64-linux release asset; selecting
+    v0.0.41 instead"`, and `LatestReleaseInfo::skipped_newer` lists each skipped tag with the
+    exact asset names it was missing, so consumers can tell "still publishing" from "this
+    platform's build failed".
+  - The search stays bounded by `UpdaterConfig::release_lookback`
+    (`with_release_lookback`, default `DEFAULT_RELEASE_LOOKBACK` = 10, clamped to `1..=100`).
+    Exhausting the window is a real, loud failure naming every inspected tag: the platform's
+    release pipeline is broken, which is a different and more serious condition than one late
+    tag.
 - Extended platform support from Unix-only to Linux, macOS, and x86_64 Windows while
   preserving Unix chmod/atomic-rename/re-exec behavior. Windows uses native `.exe` naming,
   leaves a verified update staged when the current executable exists, and reports actionable
