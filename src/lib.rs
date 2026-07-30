@@ -1423,8 +1423,11 @@ fn replacement_failure_error(
 /// Windows, so the naming rules can be tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_sidecar_path(destination: &Path) -> PathBuf {
-    // A per-process counter disambiguates calls that land in the same clock tick; the clock
-    // alone is not a uniqueness guarantee, and its granularity is far coarser on Windows.
+    // A per-process counter disambiguates calls that land on the same clock reading. Do not
+    // reduce this to an argument about clock resolution: `SystemTime` is a wall clock, so it
+    // can repeat or step backwards across an NTP adjustment on any platform regardless of how
+    // fine-grained it is. The counter is a guarantee; a resolution claim would only be a
+    // probabilistic argument whose truth changes with target, toolchain and hardware.
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -1444,8 +1447,7 @@ fn windows_sidecar_path(destination: &Path) -> PathBuf {
 }
 
 /// Sidecar file name from its parts, split out so the uniqueness rule can be proven with a
-/// fixed clock reading instead of depending on the host clock being fine-grained enough to
-/// expose a collision.
+/// fixed clock reading instead of depending on the host clock to expose a collision.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn sidecar_file_name(base: &str, pid: u32, nanos: u128, sequence: u64) -> String {
     format!("{base}.old-{pid}-{nanos}-{sequence}")
@@ -2713,11 +2715,10 @@ mod tests {
             "unexpected sidecar name: {}",
             first.display()
         );
-        // Two calls in the same clock tick must not collide, or a second concurrent install
-        // would move the first one's saved incumbent aside and lose it. A couple of calls
-        // cannot prove that on a fine-grained clock, so generate enough to outrun the clock
-        // granularity — the real risk is on Windows, where `SystemTime` is far coarser than
-        // on Linux and the timestamp alone is not a uniqueness guarantee.
+        // Two calls must not collide, or a second concurrent install would move the first
+        // one's saved incumbent aside and lose it. This loop is a smoke check only: it cannot
+        // fail while the clock separates every call, which it does here. The fixed-timestamp
+        // assertion below is the one that actually carries the guarantee.
         assert_ne!(
             first,
             second,
@@ -2728,16 +2729,14 @@ mod tests {
         let many: std::collections::HashSet<PathBuf> = (0..1000)
             .map(|_| windows_sidecar_path(destination))
             .collect();
-        assert_eq!(
-            many.len(),
-            1000,
-            "sidecar paths must stay unique faster than the clock ticks"
-        );
+        assert_eq!(many.len(), 1000, "sidecar paths must be unique");
 
-        // The above cannot fail on a clock fine-grained enough to separate every call, which
-        // is exactly the case on Linux — so pin the actual rule with a FIXED clock reading:
-        // identical timestamps must still produce distinct names. This is the guarantee that
-        // matters on Windows, where the clock is coarse enough to repeat.
+        // The real rule, pinned with a FIXED clock reading so it holds on every platform:
+        // identical timestamps must still produce distinct names. `SystemTime` is a wall
+        // clock and can repeat or step backwards across an NTP adjustment no matter how
+        // fine-grained it is, so uniqueness must not depend on it. Removing the counter fails
+        // this assertion immediately, while the loop above keeps passing — which is exactly
+        // why the loop alone was not enough.
         assert_ne!(
             sidecar_file_name("toolx.exe", 1234, 42, 0),
             sidecar_file_name("toolx.exe", 1234, 42, 1),
