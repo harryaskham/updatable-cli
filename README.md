@@ -15,6 +15,9 @@ synchronous Rust API (`<tool> update`, `<tool> status`, …) and matching MCP to
 - Platform-aware release selection: updates resolve against the newest release that actually
   carries an asset for the running platform, with a bounded lookback (see
   [Platform-incomplete releases](#platform-incomplete-releases)).
+- `Updater::install_latest_to_dir` / `Updater::install_release_to_dir` to install a release
+  into an explicit target directory instead of over the running binary, returning an
+  `InstallReceipt` describing exactly what was written.
 - `maybe_apply_staged_update("<tool>")` to swap any staged `<tool>_next` into `<tool>` and
   re-exec on the next Unix launch. On Windows it detects `tool_next.exe`, leaves the locked
   current `tool.exe` untouched, and prints actionable deferred-replacement guidance.
@@ -66,6 +69,57 @@ Runnable examples live in [`examples/`](examples/):
 - `cargo run --example status` — print install/staging status (network-free).
 - `cargo run --example update` — run the full check → stage → promote flow.
 - `cargo run --example private_repo` — configure updates from a private GitHub repo (token sources).
+- `cargo run --example install_to_dir -- <dir>` — install a release into an explicit directory
+  instead of over the running binary.
+
+## Installing to an explicit directory
+
+The default flow replaces the running executable in place. That is impossible when the
+running binary is immutable or package-managed — a `/nix/store/...-mytool-1.2.3/bin/mytool`
+path, a Homebrew cellar, a read-only image — where an in-place write would fail, or worse,
+corrupt the closure if it somehow succeeded.
+
+For those hosts, install a resolved release into a directory you choose:
+
+```rust,ignore
+use updatable_cli::{Updater, UpdaterConfig};
+
+let updater = Updater::new(UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/mytool"));
+
+// Resolves the latest release, verifies its sha256, and writes `<dir>/mytool`.
+let receipt = updater.install_latest_to_dir("/home/me/.local/bin")?;
+
+println!("installed {} ({}) to {}", receipt.version, receipt.source_asset, receipt.destination);
+println!("archive sha256 {} / binary sha256 {}", receipt.archive_sha256, receipt.binary_sha256);
+```
+
+Every check the in-place update performs is preserved: version resolution, platform asset
+selection, sha256 verification against the published checksum asset, executable permissions,
+and an atomic replace performed *within* the target directory, so the destination is never
+observed half-written. The target directory is created when missing, and
+`install_release_to_dir` takes an already-resolved `LatestReleaseInfo` when you want to pin
+the release yourself.
+
+Unlike `run_update`, this does **not** require the release to be newer than the running
+version: an explicit destination is being written on purpose, including to seed a directory
+that has no copy yet.
+
+`install_latest_to_dir` resolves through `check_latest`, so it inherits the platform-aware
+selection described in [Platform-incomplete releases](#platform-incomplete-releases): if the
+newest published release has no asset for this platform, the newest one that does is
+installed and `receipt.selection_note` explains why. Surface that note when rendering a
+receipt, otherwise a deliberate fallback looks like an install of the latest release.
+
+### Scope boundary: callers own policy
+
+This crate does **not** decide where installing is acceptable. It performs no
+package-manager detection, no `PATH`-precedence checking, and no store protection. It
+installs where it is told and reports exactly what it wrote — resolved source asset,
+version, destination path, and artifact hashes — via `InstallReceipt`.
+
+Deciding that `/nix/store` and Homebrew destinations must be refused, that the destination
+must precede a package-managed binary on `PATH`, and that shadowing deserves a loud receipt
+is the **host's** responsibility, because only the host knows its own installation contract.
 
 ## Install path contract
 

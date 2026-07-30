@@ -11,6 +11,9 @@
 //!   verifying its sha256, mirroring caco's `caco_next` staging contract.
 //! - [`Updater::promote_next`] to atomically rename the staged binary to `<install_dir>/<tool>`.
 //! - [`Updater::run_update`] for the high-level `<tool> update` flow.
+//! - [`Updater::install_latest_to_dir`] / [`Updater::install_release_to_dir`] to install a
+//!   release into an explicit caller-supplied directory instead of over the running binary,
+//!   returning an [`InstallReceipt`] describing exactly what was written.
 //! - [`mcp::register_update_tool`] to expose the same surface as an `mcp-cli` tool.
 //!
 //! The host runtime is also expected to call [`maybe_apply_staged_update`] at process entry
@@ -411,6 +414,42 @@ pub struct LatestReleaseInfo {
     pub selection_note: Option<String>,
 }
 
+/// Receipt describing exactly what an explicit-directory install wrote.
+///
+/// Returned by [`Updater::install_latest_to_dir`] and [`Updater::install_release_to_dir`].
+/// It is deliberately descriptive rather than prescriptive: this crate does not decide
+/// whether a destination was an acceptable place to install, it only reports the resolved
+/// source asset, version, destination path, and artifact hashes so a caller can apply its
+/// own policy and emit its own receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InstallReceipt {
+    /// Tool name as it appears on disk.
+    pub tool: String,
+    /// GitHub `owner/repo` slug the release was resolved from.
+    pub repo_slug: String,
+    /// Raw release tag the asset came from (e.g. `v1.2.3`).
+    pub tag: String,
+    /// Release version with any leading `v` stripped (e.g. `1.2.3`).
+    pub version: String,
+    /// File name of the release archive the binary was extracted from.
+    pub source_asset: String,
+    /// Path of the binary inside the release archive.
+    pub source_binary_in_archive: String,
+    /// Absolute-as-given destination path that was written.
+    pub destination: String,
+    /// Verified sha256 of the downloaded release archive (matches the published checksum asset).
+    pub archive_sha256: String,
+    /// sha256 of the exact bytes written to [`destination`](Self::destination).
+    pub binary_sha256: String,
+    /// Whether an existing file at the destination was replaced.
+    pub replaced_existing: bool,
+    /// Copied from [`LatestReleaseInfo::selection_note`]: set when the installed release was
+    /// not the newest published one because newer releases carried no asset for this
+    /// platform. A caller rendering a receipt should surface this, otherwise an install that
+    /// deliberately fell back would look like it installed the latest release.
+    pub selection_note: Option<String>,
+}
+
 /// Outcome of a high-level `run_update` call (the `<tool> update` flow).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UpdateOutcome {
@@ -433,6 +472,18 @@ pub struct UpdateOutcome {
 /// Drives the self-update flow for a single configured tool.
 pub struct Updater {
     config: UpdaterConfig,
+}
+
+/// A downloaded, digest-verified release archive unpacked into a temporary directory.
+struct ExtractedRelease {
+    /// Resolved archive/checksum/in-archive names for this release and platform.
+    asset_names: AssetNames,
+    /// Verified sha256 of the downloaded archive.
+    archive_sha256: String,
+    /// Path of the unpacked binary inside [`Self::_tempdir`].
+    binary_path: PathBuf,
+    /// Owns the temporary directory so `binary_path` stays valid for this value's lifetime.
+    _tempdir: tempfile::TempDir,
 }
 
 impl Updater {
@@ -632,12 +683,13 @@ impl Updater {
         }
     }
 
-    /// Download the release archive for `latest`, verify its sha256, and write
-    /// the binary to `<install_dir>/<tool>_next`. Returns the staged path.
-    pub fn stage_next(&self, latest: &LatestReleaseInfo) -> Result<PathBuf> {
-        let install_dir = self.config.install_dir()?;
-        fs::create_dir_all(&install_dir)
-            .with_context(|| format!("create {}", install_dir.display()))?;
+    /// Select the platform asset for `latest`, download it, verify its sha256 against the
+    /// published checksum asset, and unpack the binary into a temporary directory.
+    ///
+    /// This is the shared front half of [`stage_next`](Self::stage_next) and
+    /// [`install_release_to_dir`](Self::install_release_to_dir): every write destination gets
+    /// exactly the same asset selection and digest verification.
+    fn fetch_verified_release(&self, latest: &LatestReleaseInfo) -> Result<ExtractedRelease> {
         let target = release_target()?;
         let asset_names = self.asset_names_for(&latest.version, &target)?;
         if !latest
@@ -672,7 +724,7 @@ impl Updater {
             checksum_accept,
             timeout,
         )?;
-        verify_sha256(&archive_bytes, &checksum_text, &asset_names.archive)?;
+        let archive_sha256 = verify_sha256(&archive_bytes, &checksum_text, &asset_names.archive)?;
 
         let tmp = tempfile::tempdir().context("create tempdir for staging release tarball")?;
         let tar_gz = flate2::read::GzDecoder::new(archive_bytes.as_slice());
@@ -688,13 +740,101 @@ impl Updater {
                 asset_names.binary_in_archive
             );
         }
+        Ok(ExtractedRelease {
+            asset_names,
+            archive_sha256,
+            binary_path,
+            _tempdir: tmp,
+        })
+    }
+
+    /// Download the release archive for `latest`, verify its sha256, and write
+    /// the binary to `<install_dir>/<tool>_next`. Returns the staged path.
+    pub fn stage_next(&self, latest: &LatestReleaseInfo) -> Result<PathBuf> {
+        let install_dir = self.config.install_dir()?;
+        fs::create_dir_all(&install_dir)
+            .with_context(|| format!("create {}", install_dir.display()))?;
+        let extracted = self.fetch_verified_release(latest)?;
         let next_path = self.config.next_binary_path()?;
         if let Some(parent) = next_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(&next_path, &binary_path)?;
+        atomic_write(&next_path, &extracted.binary_path)?;
         set_executable(&next_path)?;
         Ok(next_path)
+    }
+
+    /// Resolve the latest release and install it into `target_dir` instead of over the
+    /// running executable. See [`install_release_to_dir`](Self::install_release_to_dir).
+    ///
+    /// Resolution goes through [`check_latest`](Self::check_latest), so this inherits the
+    /// platform-aware selection: if the newest published release carries no asset for this
+    /// platform, the newest release that does is installed instead, and the reason is
+    /// reported in [`InstallReceipt::selection_note`].
+    ///
+    /// Unlike [`run_update`](Self::run_update) this does **not** consult
+    /// [`LatestReleaseInfo::newer_than_current`]: a caller asking for an explicit
+    /// destination is installing there on purpose, including to re-install or to seed a
+    /// directory that has no copy yet.
+    pub fn install_latest_to_dir(&self, target_dir: impl AsRef<Path>) -> Result<InstallReceipt> {
+        let latest = self.check_latest()?;
+        self.install_release_to_dir(&latest, target_dir)
+    }
+
+    /// Download the platform asset for `latest`, verify its sha256, and install the binary
+    /// as `<target_dir>/<tool>` (`<tool>.exe` on Windows), returning an [`InstallReceipt`].
+    ///
+    /// This is the first-party answer for hosts whose running executable is immutable or
+    /// package-managed (a `/nix/store/...` path, a Homebrew cellar, a read-only image): the
+    /// running binary is never touched, and the release lands in a directory the caller
+    /// chose. Every check the in-place update performs is preserved — version resolution,
+    /// platform asset selection, sha256 verification against the published checksum asset,
+    /// executable permissions, and an atomic replace performed *within* `target_dir` so the
+    /// destination is never observed half-written.
+    ///
+    /// `target_dir` is created when missing.
+    ///
+    /// # Scope boundary
+    ///
+    /// This crate performs **no** package-manager detection, **no** `PATH`-precedence
+    /// checking, and **no** store protection. It installs where it is told and reports what
+    /// it wrote; deciding whether a destination is acceptable (and warning about shadowing)
+    /// is the caller's policy.
+    pub fn install_release_to_dir(
+        &self,
+        latest: &LatestReleaseInfo,
+        target_dir: impl AsRef<Path>,
+    ) -> Result<InstallReceipt> {
+        let target_dir = target_dir.as_ref();
+        if target_dir.as_os_str().is_empty() {
+            bail!("install target directory must not be empty");
+        }
+        if target_dir.exists() && !target_dir.is_dir() {
+            bail!(
+                "install target {} exists and is not a directory",
+                target_dir.display()
+            );
+        }
+        fs::create_dir_all(target_dir)
+            .with_context(|| format!("create install target {}", target_dir.display()))?;
+        let extracted = self.fetch_verified_release(latest)?;
+        let destination = target_dir.join(executable_file_name(&self.config.tool_name));
+        let binary_sha256 = sha256_file(&extracted.binary_path)?;
+        let replaced_existing = install_binary(&extracted.binary_path, &destination)?;
+        set_executable(&destination)?;
+        Ok(InstallReceipt {
+            tool: self.config.tool_name.clone(),
+            repo_slug: self.config.repo_slug.clone(),
+            tag: latest.tag.clone(),
+            version: latest.version.clone(),
+            source_asset: extracted.asset_names.archive.clone(),
+            source_binary_in_archive: extracted.asset_names.binary_in_archive.clone(),
+            destination: destination.display().to_string(),
+            archive_sha256: extracted.archive_sha256,
+            binary_sha256,
+            replaced_existing,
+            selection_note: latest.selection_note.clone(),
+        })
     }
 
     /// Promote `<install>/<tool>_next` to `<install>/<tool>`. Returns the installed path
@@ -1044,7 +1184,9 @@ pub fn gh_auth_token(account: Option<&str>) -> Option<String> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<()> {
+/// Verify `bytes` against the first whitespace-delimited digest in `checksum_text`,
+/// returning the verified lowercase sha256 hex digest.
+fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<String> {
     let expected = checksum_text
         .split_whitespace()
         .next()
@@ -1056,7 +1198,86 @@ fn verify_sha256(bytes: &[u8], checksum_text: &str, asset_name: &str) -> Result<
     if expected != actual {
         bail!("checksum mismatch for {asset_name}: expected {expected}, got {actual}");
     }
-    Ok(())
+    Ok(actual)
+}
+
+/// Lowercase sha256 hex digest of the file at `path`, streamed so a large binary is never
+/// buffered in full.
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open {} to hash", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Install `source` as `destination`, atomically within the destination's own directory.
+///
+/// Returns whether an existing file at `destination` was replaced. The payload is copied to
+/// a sibling temporary file and made executable *before* it becomes visible at
+/// `destination`, so no caller ever observes a half-written or non-executable binary.
+fn install_binary(source: &Path, destination: &Path) -> Result<bool> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("destination {} has no parent", destination.display()))?;
+    let replaced_existing = destination.exists();
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create staging file in {}", parent.display()))?;
+    let mut src =
+        fs::File::open(source).with_context(|| format!("open source {}", source.display()))?;
+    std::io::copy(&mut src, tmp.as_file_mut())?;
+    tmp.flush()?;
+    set_executable(tmp.path())?;
+
+    // Windows cannot rename over an existing file, and the destination may be a locked or
+    // running image. Move the incumbent aside first so a failure is recoverable, and restore
+    // it if the replacement cannot be persisted.
+    #[cfg(windows)]
+    if replaced_existing {
+        let backup = windows_sidecar_path(destination);
+        fs::rename(destination, &backup).with_context(|| {
+            format!(
+                "move existing {} aside before installing; close any running instance and retry",
+                destination.display()
+            )
+        })?;
+        return match tmp.persist(destination) {
+            Ok(_) => {
+                let _ = fs::remove_file(&backup);
+                Ok(replaced_existing)
+            }
+            Err(err) => {
+                let _ = fs::rename(&backup, destination);
+                Err(anyhow!("persist {} failed: {err}", destination.display()))
+            }
+        };
+    }
+
+    tmp.persist(destination)
+        .map_err(|err| anyhow!("persist {} failed: {err}", destination.display()))?;
+    Ok(replaced_existing)
+}
+
+/// Unique sidecar path used to move an incumbent Windows executable out of the way.
+#[cfg(windows)]
+fn windows_sidecar_path(destination: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str(&format!(".old-{}-{nanos}", std::process::id()));
+    destination.with_file_name(name)
 }
 
 fn atomic_write(destination: &Path, source: &Path) -> Result<()> {
@@ -1940,6 +2161,331 @@ mod tests {
                 .exists(),
             "an archive missing the binary must not stage the next binary"
         );
+    }
+
+    /// Build a valid release fixture for `toolx` at `version` on the running platform:
+    /// `(archive_name, checksum_name, tarball_bytes, checksum_body, archive_digest)`.
+    fn release_fixture(
+        version: &str,
+        payload: &[u8],
+    ) -> (String, String, Vec<u8>, Vec<u8>, String) {
+        let target = release_target().unwrap();
+        let archive_name = format!("toolx-{version}-{target}.tar.gz");
+        let checksum_name = format!("toolx-{version}-{target}.sha256");
+        let inner = format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let tarball = gzip_tar_with_entry(&inner, payload);
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let digest = hex::encode(hasher.finalize());
+        let checksum_body = format!("{digest}  {archive_name}\n").into_bytes();
+        (archive_name, checksum_name, tarball, checksum_body, digest)
+    }
+
+    fn release_info(version: &str, assets: Vec<String>) -> LatestReleaseInfo {
+        LatestReleaseInfo {
+            tag: format!("v{version}"),
+            version: version.to_string(),
+            html_url: None,
+            assets,
+            release_assets: Vec::new(),
+            newer_than_current: true,
+            skipped_newer: Vec::new(),
+            selection_note: None,
+        }
+    }
+
+    #[test]
+    fn install_release_to_dir_writes_binary_and_reports_a_full_receipt() {
+        // The configured install dir (where an in-place update would land) is deliberately
+        // a *different* directory from the explicit target, so this proves the normal
+        // install/staging paths are untouched by an explicit-destination install.
+        let install = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        // A not-yet-existing subdirectory: the install must create it.
+        let target_dir = target_root.path().join("nested").join("bin");
+
+        let version = "9.9.9";
+        let payload = b"explicit-target payload\n";
+        let (archive_name, checksum_name, tarball, checksum_body, archive_digest) =
+            release_fixture(version, payload);
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(install.path().to_path_buf());
+        config.download_base = Some(base);
+        let latest = release_info(version, vec![archive_name.clone(), checksum_name]);
+        let receipt = Updater::new(config)
+            .install_release_to_dir(&latest, &target_dir)
+            .expect("install to explicit dir succeeds");
+        handle.join().unwrap();
+
+        let destination = target_dir.join(executable_file_name("toolx"));
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+
+        // The receipt describes exactly what was written.
+        assert_eq!(receipt.tool, "toolx");
+        assert_eq!(receipt.repo_slug, "octocat/example");
+        assert_eq!(receipt.tag, format!("v{version}"));
+        assert_eq!(receipt.version, version);
+        assert_eq!(receipt.source_asset, archive_name);
+        assert_eq!(receipt.destination, destination.display().to_string());
+        assert_eq!(receipt.archive_sha256, archive_digest);
+        assert!(!receipt.replaced_existing);
+        assert!(
+            receipt.selection_note.is_none(),
+            "the newest release carried this platform's asset, so no fallback note is due"
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        assert_eq!(receipt.binary_sha256, hex::encode(hasher.finalize()));
+
+        // The running-binary contract is untouched: nothing installed or staged in the
+        // configured install dir.
+        assert!(!install.path().join(executable_file_name("toolx")).exists());
+        assert!(
+            !install
+                .path()
+                .join(staged_executable_file_name("toolx"))
+                .exists()
+        );
+
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&destination).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o755,
+                "explicitly installed binary should be chmod 0755"
+            );
+        }
+    }
+
+    #[test]
+    fn install_receipt_surfaces_the_platform_fallback_note() {
+        // When selection deliberately skipped a newer, platform-incomplete release, the
+        // receipt must say so — otherwise a caller rendering it would claim to have
+        // installed the latest release when it knowingly installed an older one.
+        let target_dir = tempfile::tempdir().unwrap();
+        let version = "9.9.8";
+        let payload = b"fallback payload\n";
+        let (archive_name, checksum_name, tarball, checksum_body, _) =
+            release_fixture(version, payload);
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.download_base = Some(base);
+        let mut latest = release_info(version, vec![archive_name, checksum_name]);
+        latest.selection_note = Some("v9.9.9 has no x86_64-linux asset".to_string());
+        let receipt = Updater::new(config)
+            .install_release_to_dir(&latest, target_dir.path())
+            .expect("install succeeds");
+        handle.join().unwrap();
+
+        assert_eq!(
+            receipt.selection_note.as_deref(),
+            Some("v9.9.9 has no x86_64-linux asset")
+        );
+    }
+
+    #[test]
+    fn install_release_to_dir_replaces_an_existing_binary_and_flags_it() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let destination = target_dir.path().join(executable_file_name("toolx"));
+        fs::write(&destination, b"stale previous copy\n").unwrap();
+
+        let version = "9.9.9";
+        let payload = b"replacement payload\n";
+        let (archive_name, checksum_name, tarball, checksum_body, _) =
+            release_fixture(version, payload);
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(target_dir.path().to_path_buf());
+        config.download_base = Some(base);
+        let latest = release_info(version, vec![archive_name, checksum_name]);
+        let receipt = Updater::new(config)
+            .install_release_to_dir(&latest, target_dir.path())
+            .expect("replacing install succeeds");
+        handle.join().unwrap();
+
+        assert!(receipt.replaced_existing);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        // The atomic swap happens within the target dir and leaves no debris behind.
+        let leftovers: Vec<String> = fs::read_dir(target_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != &executable_file_name("toolx"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "install should leave no temp/backup debris: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn install_release_to_dir_ignores_newer_than_current() {
+        // A forced install to an explicit directory is not an "update": it must proceed
+        // even when the resolved release is not newer than the running version, because the
+        // destination may have no copy at all (or an older one).
+        let target_dir = tempfile::tempdir().unwrap();
+        let version = "0.0.1";
+        let payload = b"older-but-explicitly-requested\n";
+        let (archive_name, checksum_name, tarball, checksum_body, _) =
+            release_fixture(version, payload);
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "9.9.9", "octocat/example");
+        config.download_base = Some(base);
+        let mut latest = release_info(version, vec![archive_name, checksum_name]);
+        latest.newer_than_current = false;
+        let receipt = Updater::new(config)
+            .install_release_to_dir(&latest, target_dir.path())
+            .expect("explicit install ignores newer_than_current");
+        handle.join().unwrap();
+
+        assert_eq!(receipt.version, version);
+        assert_eq!(
+            fs::read(target_dir.path().join(executable_file_name("toolx"))).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn install_release_to_dir_rejects_checksum_mismatch_and_writes_nothing() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let version = "9.9.9";
+        let (archive_name, checksum_name, tarball, _, _) =
+            release_fixture(version, b"tampered payload\n");
+        let bad_checksum = format!("{}  {archive_name}\n", "0".repeat(64)).into_bytes();
+        let (base, handle) = spawn_routed_http(vec![
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.clone().leak(), bad_checksum),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.download_base = Some(base);
+        let latest = release_info(version, vec![archive_name, checksum_name]);
+        let err = Updater::new(config)
+            .install_release_to_dir(&latest, target_dir.path())
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !target_dir
+                .path()
+                .join(executable_file_name("toolx"))
+                .exists(),
+            "a checksum mismatch must never write the destination binary"
+        );
+    }
+
+    #[test]
+    fn install_release_to_dir_errors_when_the_platform_asset_is_missing() {
+        // No matching asset: bail before any download, and leave a pre-existing binary at
+        // the destination exactly as it was.
+        let target_dir = tempfile::tempdir().unwrap();
+        let destination = target_dir.path().join(executable_file_name("toolx"));
+        fs::write(&destination, b"incumbent\n").unwrap();
+
+        let updater = Updater::new(UpdaterConfig::new("toolx", "0.1.0", "octocat/example"));
+        let latest = release_info(
+            "9.9.9",
+            vec!["toolx-9.9.9-some-other-platform.tar.gz".into()],
+        );
+        let err = updater
+            .install_release_to_dir(&latest, target_dir.path())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("has no asset"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"incumbent\n");
+    }
+
+    #[test]
+    fn install_release_to_dir_rejects_a_target_that_is_not_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("a-file");
+        fs::write(&not_a_dir, b"not a directory\n").unwrap();
+
+        let updater = Updater::new(UpdaterConfig::new("toolx", "0.1.0", "octocat/example"));
+        let latest = release_info("9.9.9", vec![]);
+        let err = updater
+            .install_release_to_dir(&latest, &not_a_dir)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {err}"
+        );
+
+        let empty = updater.install_release_to_dir(&latest, "").unwrap_err();
+        assert!(
+            empty.to_string().contains("must not be empty"),
+            "unexpected error: {empty}"
+        );
+    }
+
+    #[test]
+    fn install_latest_to_dir_resolves_the_release_then_installs_it() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let version = "9.9.9";
+        let payload = b"resolved-from-latest\n";
+        let (archive_name, checksum_name, tarball, checksum_body, _) =
+            release_fixture(version, payload);
+        let api_body = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"name":"{archive_name}"}},{{"name":"{checksum_name}"}}]}}"#
+        )
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![
+            ("releases?", api_body),
+            (archive_name.clone().leak(), tarball),
+            (checksum_name.leak(), checksum_body),
+        ]);
+
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let receipt = Updater::new(config)
+            .install_latest_to_dir(target_dir.path())
+            .expect("install_latest_to_dir succeeds");
+        handle.join().unwrap();
+
+        assert_eq!(receipt.version, version);
+        assert_eq!(receipt.source_asset, archive_name);
+        assert_eq!(
+            fs::read(target_dir.path().join(executable_file_name("toolx"))).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn sha256_file_matches_the_in_memory_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Larger than the 64 KiB streaming buffer, so the chunked path is exercised.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let path = tmp.path().join("payload.bin");
+        fs::write(&path, &payload).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        assert_eq!(sha256_file(&path).unwrap(), hex::encode(hasher.finalize()));
     }
 
     #[test]

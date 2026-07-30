@@ -35,7 +35,14 @@ and will move under the first released version when `0.1.0` is cut.
   existing executable may be locked.
 - Test coverage: mock-HTTP `check_latest`/`stage_next` happy paths and
   `promote_next` / `maybe_apply_staged_update` integration tests.
-- Runnable examples in `examples/` (`status`, `update`, `private_repo`).
+- `Updater::install_latest_to_dir` / `Updater::install_release_to_dir`: resolve, download,
+  and sha256-verify a release, then install it into an explicit caller-supplied directory
+  instead of over the running executable, returning an `InstallReceipt` (resolved source
+  asset, tag/version, destination path, verified archive sha256, written-binary sha256, and
+  whether an existing file was replaced, and the platform-fallback `selection_note`). Intended
+  for hosts whose running binary is immutable or package-managed. The crate applies no
+  package-manager, `PATH`-precedence, or store policy — callers own that decision.
+- Runnable examples in `examples/` (`status`, `update`, `private_repo`, `install_to_dir`).
 
 ### Changed
 
