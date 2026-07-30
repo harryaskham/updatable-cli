@@ -1362,10 +1362,16 @@ fn install_binary(source: &Path, destination: &Path) -> Result<bool> {
                 let _ = fs::remove_file(&backup);
                 Ok(replaced_existing)
             }
-            Err(err) => {
-                let _ = fs::rename(&backup, destination);
-                Err(anyhow!("persist {} failed: {err}", destination.display()))
-            }
+            Err(err) => Err(replacement_failure_error(
+                destination,
+                &backup,
+                &err.to_string(),
+                fs::rename(&backup, destination)
+                    .err()
+                    .as_ref()
+                    .map(|restore| restore.to_string())
+                    .as_deref(),
+            )),
         };
     }
 
@@ -1374,19 +1380,75 @@ fn install_binary(source: &Path, destination: &Path) -> Result<bool> {
     Ok(replaced_existing)
 }
 
+/// Error for a failed Windows replacement, distinguishing the two very different outcomes.
+///
+/// `restore_error` is `None` when the incumbent was successfully moved back: the install had
+/// no effect and a retry is safe. When it is `Some`, both halves failed — there is now no
+/// installed binary and the only copy is the sidecar — so the message must name the sidecar
+/// and say how to recover. That is the one outcome of this function where a human has to
+/// intervene, and reporting only "persist failed" there would leave a tool uninstalled
+/// without saying where it went (bd-1eca98).
+///
+/// Compiled on every platform, but only called on Windows: the message logic is pure and
+/// worth testing everywhere rather than only where it can run.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn replacement_failure_error(
+    destination: &Path,
+    backup: &Path,
+    persist_error: &str,
+    restore_error: Option<&str>,
+) -> anyhow::Error {
+    match restore_error {
+        None => anyhow!(
+            "persist {} failed: {persist_error}; the previous binary was restored, so the \
+             install had no effect and can be retried",
+            destination.display()
+        ),
+        Some(restore_error) => anyhow!(
+            "persist {} failed: {persist_error}; the previous binary could NOT be restored \
+             ({restore_error}) and is now at {}: nothing is installed at {} — rename {} back \
+             to it to recover",
+            destination.display(),
+            backup.display(),
+            destination.display(),
+            backup.display()
+        ),
+    }
+}
+
 /// Unique sidecar path used to move an incumbent Windows executable out of the way.
-#[cfg(windows)]
+///
+/// Always in the destination's own directory, so the move-aside is a rename within one
+/// filesystem and never crosses a mount. Compiled on every platform but only called on
+/// Windows, so the naming rules can be tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn windows_sidecar_path(destination: &Path) -> PathBuf {
+    // A per-process counter disambiguates calls that land in the same clock tick; the clock
+    // alone is not a uniqueness guarantee, and its granularity is far coarser on Windows.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    let mut name = destination
+    let base = destination
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push_str(&format!(".old-{}-{nanos}", std::process::id()));
-    destination.with_file_name(name)
+    destination.with_file_name(sidecar_file_name(
+        &base,
+        std::process::id(),
+        nanos,
+        sequence,
+    ))
+}
+
+/// Sidecar file name from its parts, split out so the uniqueness rule can be proven with a
+/// fixed clock reading instead of depending on the host clock being fine-grained enough to
+/// expose a collision.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sidecar_file_name(base: &str, pid: u32, nanos: u128, sequence: u64) -> String {
+    format!("{base}.old-{pid}-{nanos}-{sequence}")
 }
 
 fn atomic_write(destination: &Path, source: &Path) -> Result<()> {
@@ -2573,6 +2635,113 @@ mod tests {
         assert_eq!(
             fs::read(target_dir.path().join(executable_file_name("toolx"))).unwrap(),
             payload
+        );
+    }
+
+    /// bd-1eca98: the Windows replacement has two failure outcomes that must not read alike.
+    /// When the incumbent is restored the host is untouched and a retry is safe; when the
+    /// restore ALSO fails the tool is effectively uninstalled and only the sidecar has it, so
+    /// the message must name the sidecar and say how to get back.
+    ///
+    /// Not `#[cfg(windows)]`: the message logic is pure, and the failure it describes is the
+    /// one a user is most likely to meet and least able to diagnose, so it is worth pinning
+    /// on every platform rather than only where the branch can run.
+    #[test]
+    fn replacement_failure_distinguishes_restored_from_stranded() {
+        let destination = Path::new("/opt/bin/toolx.exe");
+        let backup = Path::new("/opt/bin/toolx.exe.old-1234-99-0");
+
+        let restored =
+            replacement_failure_error(destination, backup, "disk full", None).to_string();
+        assert!(
+            restored.contains("disk full") && restored.contains("restored"),
+            "a recovered failure should say the incumbent came back: {restored}"
+        );
+        assert!(
+            restored.contains("can be retried"),
+            "a recovered failure should say a retry is safe: {restored}"
+        );
+        assert!(
+            !restored.contains("old-1234-99-0"),
+            "no sidecar exists after a successful restore, so naming one would be misleading: \
+             {restored}"
+        );
+
+        let stranded =
+            replacement_failure_error(destination, backup, "disk full", Some("access denied"))
+                .to_string();
+        assert!(
+            stranded.contains("disk full") && stranded.contains("access denied"),
+            "both underlying errors matter when nothing could be recovered: {stranded}"
+        );
+        assert!(
+            stranded.contains("/opt/bin/toolx.exe.old-1234-99-0"),
+            "the user cannot recover without the sidecar path: {stranded}"
+        );
+        assert!(
+            stranded.contains("NOT be restored"),
+            "the unrecoverable case must be unmistakable: {stranded}"
+        );
+        assert!(
+            stranded.contains("recover"),
+            "the message must tell the user what to do, not just what broke: {stranded}"
+        );
+    }
+
+    #[test]
+    fn windows_sidecar_path_stays_beside_the_destination_and_is_unique() {
+        let destination = Path::new("/opt/bin/toolx.exe");
+        let first = windows_sidecar_path(destination);
+        let second = windows_sidecar_path(destination);
+
+        // The move-aside must be a rename within one directory, never across a mount.
+        assert_eq!(
+            first.parent(),
+            destination.parent(),
+            "sidecar must live beside the destination"
+        );
+        assert_ne!(
+            first, destination,
+            "the sidecar must not be the destination itself"
+        );
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("toolx.exe.old-"),
+            "unexpected sidecar name: {}",
+            first.display()
+        );
+        // Two calls in the same clock tick must not collide, or a second concurrent install
+        // would move the first one's saved incumbent aside and lose it. A couple of calls
+        // cannot prove that on a fine-grained clock, so generate enough to outrun the clock
+        // granularity — the real risk is on Windows, where `SystemTime` is far coarser than
+        // on Linux and the timestamp alone is not a uniqueness guarantee.
+        assert_ne!(
+            first,
+            second,
+            "consecutive sidecar paths must be unique: {} vs {}",
+            first.display(),
+            second.display()
+        );
+        let many: std::collections::HashSet<PathBuf> = (0..1000)
+            .map(|_| windows_sidecar_path(destination))
+            .collect();
+        assert_eq!(
+            many.len(),
+            1000,
+            "sidecar paths must stay unique faster than the clock ticks"
+        );
+
+        // The above cannot fail on a clock fine-grained enough to separate every call, which
+        // is exactly the case on Linux — so pin the actual rule with a FIXED clock reading:
+        // identical timestamps must still produce distinct names. This is the guarantee that
+        // matters on Windows, where the clock is coarse enough to repeat.
+        assert_ne!(
+            sidecar_file_name("toolx.exe", 1234, 42, 0),
+            sidecar_file_name("toolx.exe", 1234, 42, 1),
+            "same pid and same timestamp must still yield distinct sidecar names"
         );
     }
 
