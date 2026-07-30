@@ -22,16 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      # No actions/cache step here on purpose (bd-a5b044). Three independent reasons:
+      #  1. `hashFiles()` is evaluated by spawning the runner's node20 external, which this
+      #     Nix-packaged runner does not ship — it fails the whole job in ~9s with
+      #     "The template is not valid ... No such file or directory".
+      #  2. The key hashed **/Cargo.lock, and this library crate intentionally does not track
+      #     Cargo.lock (see the windows job), so the key could never vary by dependency set.
+      #  3. The step existed for EPHEMERAL azure runners that start empty. These runners are
+      #     persistent, with a stable workdir (/var/lib/github-runner-workdirs/<runner>/...)
+      #     and a stable HOME, so ~/.cargo and target/ already survive between runs.
 
       # The self-hosted nix runners ship no Rust toolchain on PATH, so the toolchain comes
       # from the flake devshell (nix develop) rather than a downloaded rustup toolchain
