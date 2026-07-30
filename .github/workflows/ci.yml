@@ -17,6 +17,10 @@ jobs:
     # previous `azure-ephemeral` target left the Unix lane dark from 2026-07-13 to 2026-07-30
     # while eight idle nix runners were online — seven Linux, one macOS). Verify with:
     #   gh api repos/harryaskham/updatable-cli/actions/runners --jq '.runners[].labels[].name'
+    #
+    # timeout-minutes below does NOT bound that: it is execution time only and does not start
+    # counting while a job is queued. Queue wait has a separate 24h limit that cannot be set
+    # from the workflow, so a wrong label still costs a full day of silence.
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 30
     steps:
@@ -50,8 +54,26 @@ jobs:
 
   windows:
     name: Windows compile + test
-    # updatable-cli is not yet in collective's self-hosted Windows runner allowlist.
-    # Use the native MSVC GitHub runner now; switch to [self-hosted, windows] once it is.
+    # GitHub-hosted on purpose, but NOT because anything blocks self-hosted. The previous
+    # comment here claimed updatable-cli was "not yet in collective's self-hosted Windows
+    # runner allowlist"; that was the same dead premise that left the Unix lane dark for 17
+    # days (bd-a5b044). No allowlist gates a repo-level runner, and this repo has six Windows
+    # runners registered directly on it, all online:
+    #   updatable-cli-win-ms-dev{,-2..-6}   [self-hosted, X64, Windows]
+    #
+    # So switching is an OPEN OPTION, not a blocked one — but it is unverified, so do not do
+    # it blind. Those runners carry no `nix` label, and this job needs rustup plus a working
+    # MSVC toolchain for the `host: x86_64-pc-windows-msvc` assertion below; whether either is
+    # present there has never been tested. The actions/cache removal above is the cautionary
+    # case: a step that was fine on GitHub-hosted died instantly on the Nix-packaged
+    # self-hosted runners over a missing node20 external.
+    #
+    # To close the question at zero risk, trial it on a PR rather than on main — this workflow
+    # already runs `on: pull_request`, so a PR flipping only this line to
+    # `[self-hosted, X64, Windows]` proves or disproves it while main stays green.
+    #
+    # This lane is not broken: green on every commit in ~72s, and currently the only enforced
+    # gate for `#[cfg(windows)]` code, which the Unix job cannot compile at all.
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
