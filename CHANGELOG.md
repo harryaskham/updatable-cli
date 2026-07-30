@@ -44,6 +44,19 @@ and will move under the first released version when `0.1.0` is cut.
   package-manager, `PATH`-precedence, or store policy — callers own that decision.
 - Runnable examples in `examples/` (`status`, `update`, `private_repo`, `install_to_dir`).
 
+### Fixed
+
+- `atomic_write` no longer pre-deletes the Windows destination before persisting the staged
+  binary (bd-ab07b8). The comment justifying it claimed Windows `persist` cannot replace an
+  existing file, which is not true of the pinned `tempfile`: `NamedTempFile::persist`
+  forwards `overwrite = true`, and the Windows implementation sets
+  `MOVEFILE_REPLACE_EXISTING`. The pre-delete turned a single atomic replace into a
+  delete-then-create with a window where the staged path did not exist. Replacement of an
+  existing destination is now pinned by a cross-platform test rather than a Windows-only one.
+  `install_binary` still moves an incumbent aside on Windows — that path can target a running
+  image, which cannot be deleted (and therefore cannot be replaced in place) but can be
+  renamed — and its comment now states that reason rather than the incorrect one.
+
 ### Changed
 
 - **Self-update resolves against the newest release that carries assets for the running

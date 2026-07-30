@@ -1236,9 +1236,10 @@ fn install_binary(source: &Path, destination: &Path) -> Result<bool> {
     tmp.flush()?;
     set_executable(tmp.path())?;
 
-    // Windows cannot rename over an existing file, and the destination may be a locked or
-    // running image. Move the incumbent aside first so a failure is recoverable, and restore
-    // it if the replacement cannot be persisted.
+    // A running or otherwise locked destination cannot be replaced in place: MoveFileEx with
+    // MOVEFILE_REPLACE_EXISTING has to delete the incumbent, and Windows refuses to delete a
+    // mapped image. Renaming the incumbent IS permitted while it runs, so move it aside first
+    // and restore it if the replacement cannot be persisted, keeping a failure recoverable.
     #[cfg(windows)]
     if replaced_existing {
         let backup = windows_sidecar_path(destination);
@@ -1289,14 +1290,12 @@ fn atomic_write(destination: &Path, source: &Path) -> Result<()> {
         fs::File::open(source).with_context(|| format!("open source {}", source.display()))?;
     std::io::copy(&mut src, tmp.as_file_mut())?;
     tmp.flush()?;
-    // Windows rename/persist cannot replace an existing destination. This is only the
-    // disposable staged path, never the installed executable, so removing an older staged
-    // payload before persisting the newly checksum-verified one is safe.
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)
-            .with_context(|| format!("remove older staged update {}", destination.display()))?;
-    }
+    // `persist` replaces an existing destination on every supported platform, so this is a
+    // single atomic swap and never a delete-then-create window: it forwards `overwrite=true`
+    // to `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)` on Windows and to `rename(2)` on Unix.
+    // (`persist_noclobber` is the non-replacing variant.) The destination here is only ever
+    // the disposable staged `<tool>_next` path, never a running image, so the locked-file
+    // handling that `install_binary` needs does not apply.
     tmp.persist(destination)
         .map_err(|err| anyhow!("persist {} failed: {err}", destination.display()))?;
     Ok(())
@@ -1646,25 +1645,44 @@ mod tests {
         assert!(note.contains(&installed.display().to_string()));
     }
 
+    /// `atomic_write` must replace an existing staged payload in one step on every platform.
+    /// This ran Windows-only while `atomic_write` pre-deleted the destination there; the
+    /// pre-delete is gone (tempfile's `persist` already passes MOVEFILE_REPLACE_EXISTING), so
+    /// the replace contract is now pinned on Unix CI too.
+    #[test]
+    fn atomic_write_replaces_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let staged = tmp.path().join(staged_executable_file_name("toolx"));
+        fs::write(&source, b"new verified payload").unwrap();
+        fs::write(&staged, b"older staged payload").unwrap();
+
+        atomic_write(&staged, &source).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"new verified payload");
+        assert!(
+            source.exists(),
+            "the source payload must survive being written elsewhere"
+        );
+    }
+
+    /// Writing to a fresh destination stays correct with no incumbent to replace.
+    #[test]
+    fn atomic_write_creates_a_missing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let staged = tmp.path().join(staged_executable_file_name("toolx"));
+        fs::write(&source, b"verified payload").unwrap();
+
+        atomic_write(&staged, &source).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"verified payload");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_default_install_dir_is_local_app_data_programs_tool() {
         let config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         let install_dir = config.install_dir().unwrap();
         assert!(install_dir.ends_with(Path::new("Programs").join("toolx")));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_atomic_write_replaces_only_the_staged_destination() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source.exe");
-        let staged = tmp.path().join("toolx_next.exe");
-        fs::write(&source, b"new verified payload").unwrap();
-        fs::write(&staged, b"older staged payload").unwrap();
-
-        atomic_write(&staged, &source).unwrap();
-        assert_eq!(fs::read(staged).unwrap(), b"new verified payload");
     }
 
     #[cfg(windows)]
