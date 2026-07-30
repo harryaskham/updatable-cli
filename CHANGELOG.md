@@ -80,6 +80,15 @@ and will move under the first released version when `0.1.0` is cut.
     Exhausting the window is a real, loud failure naming every inspected tag: the platform's
     release pipeline is broken, which is a different and more serious condition than one late
     tag.
+  - Because selection can now return an *older* release, a non-semver host is no longer
+    allowed to treat "different tag" as "newer" in that case (bd-d52a2a). When a fallback is
+    selected and neither its version nor `current_version` parses as semver, the ordering is
+    unprovable, so the update is declined rather than silently installing a possible
+    downgrade: `newer_than_current` is `false` and `LatestReleaseInfo::downgrade_risk_note`
+    (also on `InstallReceipt`) explains why. `UpdaterConfig::allow_unprovable_fallback`
+    (`with_allow_unprovable_fallback`, default `false`) opts in, and the resulting
+    `UpdateOutcome::note` still reports that the install could be a downgrade. Semver hosts
+    and the non-fallback non-semver path are unaffected.
 - Extended platform support from Unix-only to Linux, macOS, and x86_64 Windows while
   preserving Unix chmod/atomic-rename/re-exec behavior. Windows uses native `.exe` naming,
   leaves a verified update staged when the current executable exists, and reports actionable

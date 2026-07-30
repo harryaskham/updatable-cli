@@ -138,6 +138,19 @@ pub struct UpdaterConfig {
     /// the updater is willing to fall back before declaring the platform's release
     /// pipeline broken.
     pub release_lookback: Option<usize>,
+    /// Allow installing a platform-fallback release whose version cannot be proven newer
+    /// than the running one. Defaults to `false`.
+    ///
+    /// Selection only falls back past a newer release when that release publishes nothing
+    /// for this platform, so a fallback candidate is by construction older than something.
+    /// When neither it nor [`current_version`](Self::current_version) parses as semver — a
+    /// host versioned `nightly`, `2026-07-30-a`, or any date/channel scheme — there is no
+    /// way to tell an upgrade from a downgrade, and the default is to decline rather than
+    /// silently install one. [`LatestReleaseInfo::downgrade_risk_note`] always explains it.
+    ///
+    /// Set this when a host knows its own ordering (for example a date scheme that only
+    /// moves forward) and would rather take the fallback than stop updating.
+    pub allow_unprovable_fallback: bool,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -175,7 +188,16 @@ impl UpdaterConfig {
             gh_token_fallback: false,
             http_timeout: None,
             release_lookback: None,
+            allow_unprovable_fallback: false,
         }
+    }
+
+    /// Allow installing a platform-fallback release that cannot be proven newer than the
+    /// running version (chainable). See
+    /// [`allow_unprovable_fallback`](Self::allow_unprovable_fallback).
+    pub fn with_allow_unprovable_fallback(mut self, allowed: bool) -> Self {
+        self.allow_unprovable_fallback = allowed;
+        self
     }
 
     /// Number of releases inspected when resolving a platform-complete release,
@@ -412,6 +434,16 @@ pub struct LatestReleaseInfo {
     /// `"v0.0.42 has no x86_64-linux release asset; selecting v0.0.41 instead"`.
     #[serde(default)]
     pub selection_note: Option<String>,
+    /// Set when this release was chosen as a platform fallback *and* its version cannot be
+    /// compared to the running version with semver, so it cannot be proven to be an upgrade.
+    ///
+    /// Selection only reaches back past a newer release when that release publishes nothing
+    /// for this platform, so a fallback candidate is by construction *older* than something.
+    /// If neither it nor the running version parses as semver, "different tag" no longer
+    /// implies "newer", and installing it could silently be a downgrade. See
+    /// [`UpdaterConfig::allow_unprovable_fallback`].
+    #[serde(default)]
+    pub downgrade_risk_note: Option<String>,
 }
 
 /// Receipt describing exactly what an explicit-directory install wrote.
@@ -448,6 +480,14 @@ pub struct InstallReceipt {
     /// platform. A caller rendering a receipt should surface this, otherwise an install that
     /// deliberately fell back would look like it installed the latest release.
     pub selection_note: Option<String>,
+    /// Copied from [`LatestReleaseInfo::downgrade_risk_note`]: set when the installed
+    /// release was a platform fallback whose version could not be proven newer than the
+    /// running one.
+    ///
+    /// An explicit-directory install is performed on the caller's authority and is never
+    /// blocked by this, but the receipt still reports it so the caller can decide whether
+    /// what it just installed was actually an upgrade.
+    pub downgrade_risk_note: Option<String>,
 }
 
 /// Outcome of a high-level `run_update` call (the `<tool> update` flow).
@@ -484,6 +524,20 @@ struct ExtractedRelease {
     binary_path: PathBuf,
     /// Owns the temporary directory so `binary_path` stays valid for this value's lifetime.
     _tempdir: tempfile::TempDir,
+}
+
+/// Result of comparing a candidate release version to the running version.
+///
+/// The third case is the point of this type: `is_newer` collapses "provably not newer" and
+/// "cannot be established" into `false`/`true` by string inequality, which is safe only when
+/// the candidate is genuinely the newest release.
+enum VersionComparison {
+    /// Both versions parse as semver and the candidate is strictly newer.
+    ProvablyNewer,
+    /// Both versions parse as semver and the candidate is not newer.
+    ProvablyNotNewer,
+    /// At least one version is not semver, so no ordering can be established.
+    Unprovable,
 }
 
 impl Updater {
@@ -625,7 +679,30 @@ impl Updater {
                 continue;
             }
             let selection_note = platform_fallback_note(&skipped, target, &candidate.tag);
-            let newer_than_current = self.is_newer(&candidate.version);
+            // Selection only reaches past a newer release when that release publishes nothing
+            // for this platform, so `skipped` being non-empty means this candidate is a
+            // fallback: something newer exists. If the ordering is also unprovable, treating
+            // "different tag" as "newer" would install a possible downgrade silently.
+            let downgrade_risk_note = if skipped.is_empty()
+                || !matches!(
+                    self.compare_to_current(&candidate.version),
+                    VersionComparison::Unprovable
+                ) {
+                None
+            } else {
+                Some(format!(
+                    "{} was selected only because newer releases publish no {target} assets, and \
+                     neither it nor the running version {} parses as semver, so it cannot be \
+                     proven newer",
+                    candidate.tag, self.config.current_version
+                ))
+            };
+            let newer_than_current =
+                if downgrade_risk_note.is_some() && !self.config.allow_unprovable_fallback {
+                    false
+                } else {
+                    self.is_newer(&candidate.version)
+                };
             return Ok(LatestReleaseInfo {
                 tag: candidate.tag.clone(),
                 version: candidate.version.clone(),
@@ -639,6 +716,7 @@ impl Updater {
                 newer_than_current,
                 skipped_newer: skipped,
                 selection_note,
+                downgrade_risk_note,
             });
         }
 
@@ -674,12 +752,26 @@ impl Updater {
     }
 
     fn is_newer(&self, latest: &str) -> bool {
+        match self.compare_to_current(latest) {
+            VersionComparison::ProvablyNewer => true,
+            VersionComparison::ProvablyNotNewer => false,
+            // Not comparable as semver. Outside a platform fallback the candidate really is
+            // the newest published release, so any different tag is an update.
+            VersionComparison::Unprovable => latest != self.config.current_version,
+        }
+    }
+
+    /// Compare `candidate` to the running version, distinguishing "provably not newer" from
+    /// "cannot be established" — a distinction [`is_newer`](Self::is_newer) deliberately
+    /// collapses, but which matters once selection can return an older release.
+    fn compare_to_current(&self, candidate: &str) -> VersionComparison {
         match (
-            semver::Version::parse(latest),
+            semver::Version::parse(candidate),
             semver::Version::parse(&self.config.current_version),
         ) {
-            (Ok(latest), Ok(current)) => latest > current,
-            _ => latest != self.config.current_version,
+            (Ok(candidate), Ok(current)) if candidate > current => VersionComparison::ProvablyNewer,
+            (Ok(_), Ok(_)) => VersionComparison::ProvablyNotNewer,
+            _ => VersionComparison::Unprovable,
         }
     }
 
@@ -834,6 +926,7 @@ impl Updater {
             binary_sha256,
             replaced_existing,
             selection_note: latest.selection_note.clone(),
+            downgrade_risk_note: latest.downgrade_risk_note.clone(),
         })
     }
 
@@ -869,16 +962,24 @@ impl Updater {
     ///
     /// When a newer release was skipped because it publishes nothing for this platform,
     /// the returned [`UpdateOutcome::note`] says so explicitly — taking an older release
-    /// silently would be its own problem.
+    /// silently would be its own problem. For the same reason, a fallback release whose
+    /// ordering cannot be proven is declined rather than installed silently; see
+    /// [`UpdaterConfig::allow_unprovable_fallback`].
     pub fn run_update(&self) -> Result<UpdateOutcome> {
         let latest = self.check_latest()?;
         let installed_path = self.config.installed_binary_path()?;
         let next_path = self.config.next_binary_path()?;
         if !latest.newer_than_current {
-            let mut note = format!(
-                "no update needed; latest is {} and current is {}",
-                latest.version, self.config.current_version
-            );
+            let mut note = match &latest.downgrade_risk_note {
+                Some(risk) => format!(
+                    "not updating: {risk}; set UpdaterConfig::allow_unprovable_fallback to \
+                     install it anyway"
+                ),
+                None => format!(
+                    "no update needed; latest is {} and current is {}",
+                    latest.version, self.config.current_version
+                ),
+            };
             if let Some(selection) = &latest.selection_note {
                 note.push_str("; ");
                 note.push_str(selection);
@@ -898,6 +999,13 @@ impl Updater {
         let mut notes: Vec<String> = Vec::new();
         if let Some(selection) = &latest.selection_note {
             notes.push(selection.clone());
+        }
+        if let Some(risk) = &latest.downgrade_risk_note {
+            // Reachable only with allow_unprovable_fallback set. An opted-in install is
+            // still not allowed to be a silent one.
+            notes.push(format!(
+                "{risk}; installing anyway because UpdaterConfig::allow_unprovable_fallback is set"
+            ));
         }
         if cfg!(windows) && promoted.is_none() {
             notes.push(windows_deferred_promotion_note(&next_path, &installed_path));
@@ -2073,16 +2181,7 @@ mod tests {
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());
         let updater = Updater::new(config);
-        let latest = LatestReleaseInfo {
-            tag: "v9.9.9".to_string(),
-            version: "9.9.9".to_string(),
-            html_url: None,
-            assets: vec!["some-unrelated-asset.txt".to_string()],
-            release_assets: Vec::new(),
-            newer_than_current: true,
-            skipped_newer: Vec::new(),
-            selection_note: None,
-        };
+        let latest = release_info("9.9.9", vec!["some-unrelated-asset.txt".to_string()]);
         let err = updater.stage_next(&latest).unwrap_err();
         assert!(
             err.to_string().contains("has no asset"),
@@ -2112,16 +2211,7 @@ mod tests {
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());
         config.download_base = Some(base);
-        let latest = LatestReleaseInfo {
-            tag: format!("v{version}"),
-            version: version.to_string(),
-            html_url: None,
-            assets: vec![archive_name, checksum_name],
-            release_assets: Vec::new(),
-            newer_than_current: true,
-            skipped_newer: Vec::new(),
-            selection_note: None,
-        };
+        let latest = release_info(version, vec![archive_name, checksum_name]);
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
         handle.join().unwrap();
         assert!(
@@ -2157,16 +2247,7 @@ mod tests {
         let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
         config.install_dir = Some(tmp.path().to_path_buf());
         config.download_base = Some(base);
-        let latest = LatestReleaseInfo {
-            tag: format!("v{version}"),
-            version: version.to_string(),
-            html_url: None,
-            assets: vec![archive_name, checksum_name],
-            release_assets: Vec::new(),
-            newer_than_current: true,
-            skipped_newer: Vec::new(),
-            selection_note: None,
-        };
+        let latest = release_info(version, vec![archive_name, checksum_name]);
         let err = Updater::new(config).stage_next(&latest).unwrap_err();
         handle.join().unwrap();
         assert!(
@@ -2209,6 +2290,7 @@ mod tests {
             newer_than_current: true,
             skipped_newer: Vec::new(),
             selection_note: None,
+            downgrade_risk_note: None,
         }
     }
 
@@ -2781,6 +2863,205 @@ mod tests {
         assert!(
             note.contains("no update needed") && note.contains("v0.0.42"),
             "unexpected note: {note}"
+        );
+    }
+
+    /// Non-semver tags sort by GitHub order (stable sort), so `releases_feed` order is the
+    /// newest-first order the selector sees.
+    fn other_target() -> &'static str {
+        if release_target().unwrap() == "aarch64-darwin" {
+            "x86_64-linux"
+        } else {
+            "aarch64-darwin"
+        }
+    }
+
+    /// bd-d52a2a: the fallback introduced by bd-0497f6 can hand back an OLDER release. For a
+    /// host whose version is not semver, `latest != current` no longer implies "newer", so
+    /// the update must be declined rather than silently installing a downgrade.
+    #[test]
+    fn non_semver_host_declines_an_unprovable_platform_fallback() {
+        let target = release_target().unwrap();
+        let api_body = releases_feed(&[
+            ("nightly-c", &[other_target()]),
+            ("nightly-a", &[target.as_str()]),
+        ])
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "nightly-b", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
+        handle.join().unwrap();
+
+        assert_eq!(info.tag, "nightly-a", "the fallback release is selected");
+        assert!(
+            !info.newer_than_current,
+            "nightly-a cannot be proven newer than nightly-b, so it must not count as an update"
+        );
+        let risk = info
+            .downgrade_risk_note
+            .expect("an unprovable fallback must be reported, not silently dropped");
+        assert!(
+            risk.contains("nightly-a") && risk.contains("nightly-b") && risk.contains("semver"),
+            "unexpected downgrade risk note: {risk}"
+        );
+        // The platform-fallback explanation is still reported separately.
+        assert!(
+            info.selection_note
+                .as_deref()
+                .is_some_and(|note| note.contains("nightly-c")),
+            "selection note should still name the skipped release: {:?}",
+            info.selection_note
+        );
+    }
+
+    #[test]
+    fn run_update_refuses_an_unprovable_fallback_with_an_actionable_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = release_target().unwrap();
+        let api_body = releases_feed(&[
+            ("nightly-c", &[other_target()]),
+            ("nightly-a", &[target.as_str()]),
+        ])
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "nightly-b", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
+        handle.join().unwrap();
+
+        assert!(
+            !outcome.staged && !outcome.promoted,
+            "a possible downgrade must not be staged or promoted"
+        );
+        assert!(
+            !tmp.path()
+                .join(staged_executable_file_name("toolx"))
+                .exists()
+        );
+        let note = outcome.note.expect("a refusal must be explained");
+        assert!(
+            note.contains("not updating")
+                && note.contains("cannot be proven newer")
+                && note.contains("allow_unprovable_fallback"),
+            "the note must say what happened and how to override it: {note}"
+        );
+    }
+
+    #[test]
+    fn allow_unprovable_fallback_opts_in_but_stays_loud() {
+        let target = release_target().unwrap();
+        let version = "nightly-a";
+        let payload = b"opted-in fallback payload\n";
+        let inner = format!("toolx-{version}-{target}/{}", executable_file_name("toolx"));
+        let tarball = gzip_tar_with_entry(&inner, payload);
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        let checksum_body = format!(
+            "{}  toolx-{version}-{target}.tar.gz\n",
+            hex::encode(hasher.finalize())
+        )
+        .into_bytes();
+        let api_body = releases_feed(&[
+            ("nightly-c", &[other_target()]),
+            (version, &[target.as_str()]),
+        ])
+        .into_bytes();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, handle) = spawn_routed_http(vec![
+            ("releases?", api_body),
+            (format!("toolx-{version}-{target}.tar.gz").leak(), tarball),
+            (
+                format!("toolx-{version}-{target}.sha256").leak(),
+                checksum_body,
+            ),
+        ]);
+        let mut config = UpdaterConfig::new("toolx", "nightly-b", "octocat/example")
+            .with_allow_unprovable_fallback(true);
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.api_base = Some(base.clone());
+        config.download_base = Some(base);
+        let outcome = Updater::new(config)
+            .run_update()
+            .expect("run_update succeeds");
+        handle.join().unwrap();
+
+        assert!(
+            outcome.staged && outcome.promoted,
+            "opting in should install the fallback"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join(executable_file_name("toolx"))).unwrap(),
+            payload
+        );
+        let note = outcome
+            .note
+            .expect("an opted-in install must still be loud");
+        assert!(
+            note.contains("cannot be proven newer") && note.contains("installing anyway"),
+            "an opted-in install must still say it could be a downgrade: {note}"
+        );
+    }
+
+    /// The guard is scoped to the fallback case only: a non-semver host whose newest release
+    /// carries this platform's assets keeps the pre-bd-0497f6 "any different tag is newer"
+    /// behaviour, because that candidate really is the newest published release.
+    #[test]
+    fn non_semver_host_still_updates_when_the_newest_release_is_complete() {
+        let target = release_target().unwrap();
+        let api_body = releases_feed(&[
+            ("nightly-c", &[target.as_str()]),
+            ("nightly-a", &[target.as_str()]),
+        ])
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "nightly-b", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
+        handle.join().unwrap();
+
+        assert_eq!(info.tag, "nightly-c");
+        assert!(
+            info.newer_than_current,
+            "no fallback happened, so the existing non-semver behaviour is unchanged"
+        );
+        assert!(info.downgrade_risk_note.is_none());
+        assert!(info.selection_note.is_none());
+    }
+
+    /// A semver host is unaffected by the guard: ordering is provable, so a fallback to an
+    /// older release is simply "not newer" and a fallback to a newer one still installs.
+    #[test]
+    fn semver_hosts_are_unaffected_by_the_unprovable_fallback_guard() {
+        let target = release_target().unwrap();
+        let api_body = releases_feed(&[
+            ("v0.0.42", &[other_target()]),
+            ("v0.0.41", &[target.as_str()]),
+        ])
+        .into_bytes();
+        let (base, handle) = spawn_routed_http(vec![("releases?", api_body)]);
+        let mut config = UpdaterConfig::new("toolx", "0.0.27", "octocat/example");
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("check_latest succeeds");
+        handle.join().unwrap();
+
+        // The helsinki case: falling back to 0.0.41 from 0.0.27 is provably an upgrade.
+        assert_eq!(info.tag, "v0.0.41");
+        assert!(info.newer_than_current);
+        assert!(
+            info.downgrade_risk_note.is_none(),
+            "semver ordering is provable, so no risk note is due"
         );
     }
 

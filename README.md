@@ -193,6 +193,37 @@ platform**:
   is reported as one — naming every inspected tag — because the platform's release pipeline
   is broken, which is a different and more serious condition than one late tag.
 
+### Non-semver hosts: a fallback that cannot be proven to be an upgrade
+
+Because selection can deliberately return an **older** release, "the resolved tag differs
+from the running version" no longer implies "newer". That distinction is invisible to
+semver hosts — ordering is provable, so an older fallback is simply not an update — but it
+matters for a host versioned `nightly`, `2026-07-30-a`, or any other date/channel scheme:
+
+```text
+current:  nightly-b
+releases: nightly-c   newest, no asset for this platform  -> skipped
+          nightly-a   has this platform's asset           -> selected
+```
+
+Nothing here can establish whether `nightly-a` is newer or older than `nightly-b`, so
+installing it could be a silent downgrade. The default is therefore to **decline**:
+`newer_than_current` is `false`, `LatestReleaseInfo::downgrade_risk_note` explains why, and
+`run_update` reports `not updating: … cannot be proven newer …` instead of quietly staging
+it.
+
+A host that knows its own ordering (a date scheme that only moves forward, say) can opt in,
+and the install stays loud — the note still says it could be a downgrade:
+
+```rust,ignore
+let config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/mytool")
+    .with_allow_unprovable_fallback(true);
+```
+
+This guard applies **only** to the fallback case. When the newest release does carry this
+platform's assets, a non-semver host keeps the original "any different tag is an update"
+behaviour, because that candidate really is the newest published release.
+
 ## Platform support
 
 Linux, macOS, and x86_64 Windows (`x86_64-pc-windows-msvc`) compile and retain the complete
@@ -210,6 +241,9 @@ canonical release suffix and downstream asset contract are agreed.
   GitHub Enterprise, a release mirror, or an air-gapped host that serves
   `<base>/<owner>/<repo>/releases/download/<tag>/<asset>`.
 - `install_dir` — overrides the default `$HOME/.local/bin`.
+- `allow_unprovable_fallback` — install a platform-fallback release even when its version
+  cannot be proven newer than the running one. Defaults to `false`; see
+  [Non-semver hosts](#non-semver-hosts-a-fallback-that-cannot-be-proven-to-be-an-upgrade).
 - `release_lookback` — how many releases to inspect, newest first, when resolving the newest
   release that carries this platform's assets. Defaults to `DEFAULT_RELEASE_LOOKBACK` (10),
   clamped to `1..=100`. See [Platform-incomplete releases](#platform-incomplete-releases).
