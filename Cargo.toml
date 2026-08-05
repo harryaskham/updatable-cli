@@ -8,7 +8,7 @@ rust-version = "1.85"
 readme = "README.md"
 repository = "https://github.com/harryaskham/updatable-cli"
 homepage = "https://github.com/harryaskham/updatable-cli"
-# Consumed git-only across the CLI suite (the mcp-cli dependency is a git dependency
+# Consumed git-only across the CLI suite (the mcp-cli-core dependency is a git dependency
 # with no crates.io version), so this crate is intentionally not published to crates.io.
 publish = false
 
@@ -20,7 +20,10 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = { version = "1", features = ["derive"] }
-mcp-cli = { git = "https://github.com/harryaskham/mcp-cli", branch = "main" }
+# The upstream package was renamed to mcp-cli-core; the Rust library remains
+# `mcp_cli`, so consumers and source imports do not change. Pin the reviewed
+# package generation instead of following main across package-name changes.
+mcp-cli = { package = "mcp-cli-core", git = "https://github.com/harryaskham/mcp-cli", rev = "81e55235df7d7335d4dc7bd1095131246d157a2a" }
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 flate2 = "1"
 tar = "0.4"
