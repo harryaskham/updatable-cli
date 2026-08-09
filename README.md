@@ -241,6 +241,10 @@ canonical release suffix and downstream asset contract are agreed.
   GitHub Enterprise, a release mirror, or an air-gapped host that serves
   `<base>/<owner>/<repo>/releases/download/<tag>/<asset>`.
 - `install_dir` — overrides the default `$HOME/.local/bin`.
+- `include_drafts` / `.with_drafts(true)` — include authenticated draft releases when
+  selecting platform-complete assets. This supports pipelines that upload each target to a
+  draft before publishing; prereleases remain excluded and GitHub still requires a token to
+  expose private/draft release metadata.
 - `allow_unprovable_fallback` — install a platform-fallback release even when its version
   cannot be proven newer than the running one. Defaults to `false`; see
   [Non-semver hosts](#non-semver-hosts-a-fallback-that-cannot-be-proven-to-be-an-upgrade).

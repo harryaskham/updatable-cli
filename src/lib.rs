@@ -138,6 +138,10 @@ pub struct UpdaterConfig {
     /// the updater is willing to fall back before declaring the platform's release
     /// pipeline broken.
     pub release_lookback: Option<usize>,
+    /// Include authenticated draft releases in platform-asset selection. Defaults
+    /// to `false`, matching GitHub's public "latest release" semantics. Drafts
+    /// remain invisible to anonymous callers and prereleases stay excluded.
+    pub include_drafts: bool,
     /// Allow installing a platform-fallback release whose version cannot be proven newer
     /// than the running one. Defaults to `false`.
     ///
@@ -188,8 +192,17 @@ impl UpdaterConfig {
             gh_token_fallback: false,
             http_timeout: None,
             release_lookback: None,
+            include_drafts: false,
             allow_unprovable_fallback: false,
         }
+    }
+
+    /// Include authenticated draft releases when selecting platform-complete
+    /// assets. Prereleases remain excluded.
+    #[must_use]
+    pub fn with_drafts(mut self, include: bool) -> Self {
+        self.include_drafts = include;
+        self
     }
 
     /// Allow installing a platform-fallback release that cannot be proven newer than the
@@ -584,8 +597,9 @@ impl Updater {
     /// release inside the lookback window carries this platform's assets, that is a real
     /// failure (the platform's release pipeline is broken) and it is reported as such.
     ///
-    /// Draft and prerelease entries are ignored, matching GitHub's "latest release"
-    /// semantics.
+    /// Prereleases are ignored. Drafts are ignored by default and may be enabled
+    /// explicitly through [`UpdaterConfig::with_drafts`] for authenticated
+    /// release pipelines that upload platform assets before publishing.
     pub fn check_latest(&self) -> Result<LatestReleaseInfo> {
         let target = release_target()?;
         let releases = self.fetch_releases()?;
@@ -647,9 +661,15 @@ impl Updater {
     ) -> Result<LatestReleaseInfo> {
         let mut candidates: Vec<ParsedRelease> = candidates
             .into_iter()
-            .filter(|release| !release.draft && !release.prerelease)
+            .filter(|release| !release.prerelease && (self.config.include_drafts || !release.draft))
             .collect();
         if candidates.is_empty() {
+            if self.config.include_drafts {
+                bail!(
+                    "no GitHub releases for {} yet (prereleases are ignored; authenticated drafts are enabled)",
+                    self.config.repo_slug
+                );
+            }
             bail!(
                 "no published GitHub releases for {} yet (drafts and prereleases are ignored)",
                 self.config.repo_slug
@@ -2911,6 +2931,24 @@ mod tests {
             info.skipped_newer.is_empty(),
             "drafts/prereleases are filtered out, not reported as platform-incomplete"
         );
+    }
+
+    #[test]
+    fn check_latest_can_select_an_authenticated_draft() {
+        let target = release_target().unwrap();
+        let body = format!(
+            r#"[{{"tag_name":"v9.9.9","draft":true,"assets":[{{"name":"toolx-9.9.9-{target}.tar.gz"}},{{"name":"toolx-9.9.9-{target}.sha256"}}]}},
+                {{"tag_name":"v9.9.8","prerelease":true,"assets":[{{"name":"toolx-9.9.8-{target}.tar.gz"}},{{"name":"toolx-9.9.8-{target}.sha256"}}]}},
+                {{"tag_name":"v9.9.7","assets":[{{"name":"toolx-9.9.7-{target}.tar.gz"}},{{"name":"toolx-9.9.7-{target}.sha256"}}]}}]"#
+        );
+        let (base, handle) = spawn_one_shot_http(body);
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example").with_drafts(true);
+        config.api_base = Some(base);
+        let info = Updater::new(config)
+            .check_latest()
+            .expect("draft selection succeeds when enabled");
+        handle.join().unwrap();
+        assert_eq!(info.tag, "v9.9.9");
     }
 
     /// The search stays bounded: the configured lookback is what the feed request asks
