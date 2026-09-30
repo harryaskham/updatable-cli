@@ -1591,11 +1591,6 @@ pub enum StagedUpdateOutcome {
         /// Why the candidate was refused.
         reason: String,
     },
-    /// The candidate was promoted and the prior executable is preserved at this path.
-    Promoted {
-        /// Path of the preserved prior executable.
-        previous_backup: PathBuf,
-    },
     /// The promoted candidate failed to start and the prior executable was restored.
     RolledBack {
         /// Why the promoted candidate failed to start.
@@ -1692,6 +1687,11 @@ fn restore_previous_executable(backup: &Path, current: &Path, expected_digest: &
 /// successful `exec` replaces the process image and never comes back. It is injected so the
 /// whole transaction, including the rollback path, is testable without replacing the test
 /// process.
+///
+/// Because of that, every value this function returns describes something that did NOT go to
+/// plan: the candidate was refused, or it was promoted and would not start. There is
+/// deliberately no "promoted successfully" variant, because that outcome is unobservable from
+/// here — on success this call never returns at all.
 #[cfg_attr(windows, allow(dead_code))]
 fn run_staged_update_transaction(
     current: &Path,
@@ -1772,7 +1772,7 @@ fn run_staged_update_transaction(
 /// Print a startup-promotion outcome, keeping each failure distinct.
 fn report_staged_update_outcome(tool_name: &str, outcome: &StagedUpdateOutcome) {
     match outcome {
-        StagedUpdateOutcome::NothingStaged | StagedUpdateOutcome::Promoted { .. } => {}
+        StagedUpdateOutcome::NothingStaged => {}
         StagedUpdateOutcome::Deferred { note } => eprintln!("warning: {note}"),
         StagedUpdateOutcome::CandidateRejected { reason } => {
             eprintln!(
