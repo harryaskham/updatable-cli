@@ -12,6 +12,25 @@ and will move under the first released version when `0.1.0` is cut.
 
 ### Added
 
+- **`run_update` no longer destroys the only recovery point** (bd-fc1380). `promote_next`
+  now preserves the binary it replaces as `<tool>_prev` and reports it on the new
+  `UpdateOutcome::preserved_previous_path`. Previously the update path renamed over the
+  installed binary with no backup and no validation, returned `promoted: true`, and printed
+  success — so a broken release surfaced only at the *next* invocation, by which point the
+  user had no working tool, no `_prev` to restore from, and a success message in their
+  scrollback. Unlike the startup path (bd-c7ac99), nothing here ever launches the candidate,
+  so the failure cannot be detected in-process.
+  - If the promotion cannot be completed after the replacement, the preserved binary is
+    restored and the two failures are reported separately.
+  - New opt-in `UpdaterConfig::validate_before_promote` (with `promotion_validation`) launches
+    the candidate before installing it. Off by default: it changes when an update is REFUSED,
+    and a validation wrong in the strict direction silently pins a host to its old version.
+    With it off, `promoted: true` asserts only that the file was moved.
+  - `stage_next`'s sha256 check is unchanged and still proves the archive matches its
+    published checksum — a different property from runnability, which is why validation is
+    worth having at all.
+  - New `UpdaterConfig::previous_binary_path()` resolves `<install>/<tool>_prev`.
+
 - **Transactional startup promotion** (bd-c7ac99): `maybe_apply_staged_update` no longer
   renames a staged candidate over the running executable and hopes. It now validates the
   candidate by launching it once (default `--version`, bounded by `validation_timeout`),

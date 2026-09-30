@@ -155,6 +155,23 @@ pub struct UpdaterConfig {
     /// Set this when a host knows its own ordering (for example a date scheme that only
     /// moves forward) and would rather take the fallback than stop updating.
     pub allow_unprovable_fallback: bool,
+    /// Launch a staged candidate once before `promote_next` installs it. Defaults to `false`.
+    ///
+    /// `stage_next` already sha256-verifies the downloaded archive, but checksum integrity
+    /// and runnability are different properties: a build for the wrong libc, a truncated
+    /// inner binary, or a broken build published with a correct checksum all verify and then
+    /// fail to run. Turning this on launches the candidate (see
+    /// [`promotion_validation`](Self::promotion_validation)) and refuses the promotion if it
+    /// cannot run at all.
+    ///
+    /// Off by default because it changes when an update is REFUSED, which is a policy change
+    /// a host should opt into: a validation that is wrong in the strict direction silently
+    /// pins a host to its old version, which is the quiet failure mode this crate exists to
+    /// avoid. Preserving the prior binary needs no opt-in and is always on.
+    pub validate_before_promote: bool,
+    /// Policy for the [`validate_before_promote`](Self::validate_before_promote) launch, and
+    /// for the startup hook. Defaults to [`StagedUpdateOptions::default`].
+    pub promotion_validation: StagedUpdateOptions,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -194,6 +211,8 @@ impl UpdaterConfig {
             release_lookback: None,
             include_drafts: false,
             allow_unprovable_fallback: false,
+            validate_before_promote: false,
+            promotion_validation: StagedUpdateOptions::default(),
         }
     }
 
@@ -264,6 +283,17 @@ impl UpdaterConfig {
         Ok(self
             .install_dir()?
             .join(staged_executable_file_name(&self.tool_name)))
+    }
+
+    /// Path of the preserved prior binary: `<tool>_prev` (`.exe` on Windows).
+    ///
+    /// A promotion replaces the only known-good binary in the install dir. This is where the
+    /// one it replaced is kept, so a bad update stays recoverable — by hand, or automatically
+    /// by [`maybe_apply_staged_update`] on the next launch.
+    pub fn previous_binary_path(&self) -> Result<PathBuf> {
+        Ok(self
+            .install_dir()?
+            .join(previous_executable_file_name(&self.tool_name)))
     }
 
     /// Path to the installed binary: `<tool>` on Unix or `<tool>.exe` on Windows.
@@ -520,6 +550,10 @@ pub struct UpdateOutcome {
     pub installed_path: String,
     /// Optional human-readable note (e.g. "no update needed").
     pub note: Option<String>,
+    /// Path of the preserved prior binary when this run replaced one, so a host can tell a
+    /// user where their previous version went.
+    #[serde(default)]
+    pub preserved_previous_path: Option<String>,
 }
 
 /// Drives the self-update flow for a single configured tool.
@@ -953,14 +987,30 @@ impl Updater {
     /// Promote `<install>/<tool>_next` to `<install>/<tool>`. Returns the installed path
     /// when a promotion happened, `None` when there was nothing staged.
     ///
+    /// The binary being replaced is preserved as `<install>/<tool>_prev` first, so a bad
+    /// update stays recoverable instead of destroying the only known-good binary. If the
+    /// promotion cannot be completed after the replacement, the preserved binary is restored
+    /// and both failures are reported separately.
+    ///
+    /// Set [`UpdaterConfig::validate_before_promote`] to launch the candidate once before
+    /// installing it; by default promotion asserts only that the file was moved into place,
+    /// not that it runs.
+    ///
     /// On Windows, replacing an existing executable is deliberately deferred because the
     /// running image may be locked. In that case this returns `Ok(None)` and leaves both
     /// `tool.exe` and the verified `tool_next.exe` untouched; the host should replace the
     /// executable after all tool processes exit (typically via an installer/bootstrapper).
     pub fn promote_next(&self) -> Result<Option<PathBuf>> {
+        self.promote_next_preserving()
+            .map(|(installed, _)| installed)
+    }
+
+    /// [`promote_next`](Self::promote_next), also reporting where the replaced binary was
+    /// preserved.
+    fn promote_next_preserving(&self) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
         let next = self.config.next_binary_path()?;
         if !next.exists() {
-            return Ok(None);
+            return Ok((None, None));
         }
         let installed = self.config.installed_binary_path()?;
         if let Some(parent) = installed.parent() {
@@ -968,13 +1018,79 @@ impl Updater {
         }
         #[cfg(windows)]
         if installed.exists() {
-            return Ok(None);
+            return Ok((None, None));
         }
         set_executable(&next)?;
-        fs::rename(&next, &installed)
-            .with_context(|| format!("promote {} -> {}", next.display(), installed.display()))?;
-        set_executable(&installed)?;
-        Ok(Some(installed))
+        if self.config.validate_before_promote {
+            validate_candidate_launch(&next, &self.config.promotion_validation).with_context(
+                || {
+                    format!(
+                        "refusing to promote {}: the staged candidate did not pass validation",
+                        next.display()
+                    )
+                },
+            )?;
+        }
+
+        // Preserve whatever is being replaced BEFORE replacing it. A first install has
+        // nothing to preserve, which is the only case where no recovery point exists.
+        let preserved = if installed.exists() {
+            let backup = self.config.previous_binary_path()?;
+            let digest = sha256_file(&installed).with_context(|| {
+                format!("hash the binary being replaced: {}", installed.display())
+            })?;
+            fs::copy(&installed, &backup).with_context(|| {
+                format!(
+                    "preserve {} as {} before promoting",
+                    installed.display(),
+                    backup.display()
+                )
+            })?;
+            Some((backup, digest))
+        } else {
+            None
+        };
+
+        if let Err(error) = fs::rename(&next, &installed) {
+            // Nothing was replaced, so the preserved copy would be misleading litter that
+            // implies an update happened.
+            if let Some((backup, _)) = &preserved {
+                let _ = fs::remove_file(backup);
+            }
+            return Err(anyhow!(
+                "promote {} -> {}: {error}",
+                next.display(),
+                installed.display()
+            ));
+        }
+
+        if let Err(error) = set_executable(&installed) {
+            // The replacement is in place but unusable. Put back what was working, and keep
+            // the two failures distinct: "could not finish the update" and "could not finish
+            // the update AND could not undo it" are different situations for an operator.
+            if let Some((backup, digest)) = &preserved {
+                return match restore_previous_executable(backup, &installed, digest) {
+                    Ok(()) => Err(anyhow!(
+                        "promoted {} but could not make it executable: {error}; \
+                         restored the previous binary",
+                        installed.display()
+                    )),
+                    Err(restore_error) => Err(anyhow!(
+                        "promoted {} but could not make it executable: {error}; \
+                         restoring the previous binary ALSO failed: {restore_error:#}; \
+                         it is preserved at {}",
+                        installed.display(),
+                        backup.display()
+                    )),
+                };
+            }
+            return Err(anyhow!(
+                "promoted {} but could not make it executable: {error}",
+                installed.display()
+            ));
+        }
+
+        Ok((Some(installed), preserved.map(|(backup, _)| backup)))
     }
 
     /// High-level `<tool> update`: resolve the newest release carrying this platform's
@@ -1012,10 +1128,11 @@ impl Updater {
                 next_path: next_path.display().to_string(),
                 installed_path: installed_path.display().to_string(),
                 note: Some(note),
+                preserved_previous_path: None,
             });
         }
         self.stage_next(&latest)?;
-        let promoted = self.promote_next()?;
+        let (promoted, preserved_previous) = self.promote_next_preserving()?;
         let mut notes: Vec<String> = Vec::new();
         if let Some(selection) = &latest.selection_note {
             notes.push(selection.clone());
@@ -1043,6 +1160,7 @@ impl Updater {
             next_path: next_path.display().to_string(),
             installed_path: installed_path.display().to_string(),
             note,
+            preserved_previous_path: preserved_previous.map(|path| path.display().to_string()),
         })
     }
 
@@ -2048,6 +2166,113 @@ mod tests {
         );
         assert!(!status.installed_exists);
         assert!(!status.next_staged);
+    }
+
+    /// bd-fc1380: promoting over an existing binary must keep the one it replaced, so a bad
+    /// update is recoverable. Before this, `run_update` destroyed the only known-good binary
+    /// and reported success.
+    #[test]
+    fn promote_next_preserves_the_binary_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        let installed = updater.config().installed_binary_path().unwrap();
+        let next = updater.config().next_binary_path().unwrap();
+        let previous = updater.config().previous_binary_path().unwrap();
+        fs::write(&installed, b"the version that works\n").unwrap();
+        fs::write(&next, b"the new version\n").unwrap();
+
+        let (promoted, preserved) = updater.promote_next_preserving().unwrap();
+        assert_eq!(promoted.unwrap(), installed);
+        assert_eq!(
+            preserved.as_deref(),
+            Some(previous.as_path()),
+            "the replaced binary's location must be reported, not just kept"
+        );
+        assert_eq!(fs::read(&installed).unwrap(), b"the new version\n");
+        assert_eq!(
+            fs::read(&previous).unwrap(),
+            b"the version that works\n",
+            "the replaced binary must be recoverable byte-for-byte"
+        );
+    }
+
+    /// A first install replaces nothing, so there is nothing to preserve and no `_prev`
+    /// should be invented.
+    #[test]
+    fn promote_next_has_nothing_to_preserve_on_a_first_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        fs::write(updater.config().next_binary_path().unwrap(), b"first\n").unwrap();
+
+        let (promoted, preserved) = updater.promote_next_preserving().unwrap();
+        assert!(promoted.is_some());
+        assert!(preserved.is_none(), "nothing was replaced");
+        assert!(
+            !updater.config().previous_binary_path().unwrap().exists(),
+            "a first install must not fabricate a recovery point"
+        );
+    }
+
+    /// Opt-in validation refuses a candidate that cannot run, and refusal must leave the
+    /// working install exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn promote_next_refuses_an_unrunnable_candidate_when_validation_is_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        config.validate_before_promote = true;
+        let updater = Updater::new(config);
+        let installed = updater.config().installed_binary_path().unwrap();
+        let next = updater.config().next_binary_path().unwrap();
+        fs::write(&installed, b"the version that works\n").unwrap();
+        // Passes a checksum happily; cannot be executed at all.
+        fs::write(&next, b"\x7fnot-an-executable").unwrap();
+
+        let error = updater.promote_next().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did not pass validation"),
+            "got: {message}"
+        );
+        assert_eq!(
+            fs::read(&installed).unwrap(),
+            b"the version that works\n",
+            "a refused candidate must not disturb the working install"
+        );
+        assert!(
+            next.exists(),
+            "the refused candidate is left for inspection"
+        );
+        assert!(
+            !updater.config().previous_binary_path().unwrap().exists(),
+            "nothing was replaced, so there must be no recovery-point litter"
+        );
+    }
+
+    /// Validation stays OFF unless asked for: the same unrunnable candidate installs fine by
+    /// default, because `promoted: true` asserts only that the file was moved.
+    #[test]
+    fn promote_next_does_not_validate_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = UpdaterConfig::new("toolx", "0.1.0", "octocat/example");
+        config.install_dir = Some(tmp.path().to_path_buf());
+        let updater = Updater::new(config);
+        assert!(!updater.config().validate_before_promote);
+        fs::write(updater.config().installed_binary_path().unwrap(), b"old\n").unwrap();
+        fs::write(
+            updater.config().next_binary_path().unwrap(),
+            b"\x7fnot-an-executable",
+        )
+        .unwrap();
+
+        updater
+            .promote_next()
+            .expect("default promotion must not launch the candidate");
     }
 
     #[test]

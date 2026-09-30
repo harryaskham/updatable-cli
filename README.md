@@ -104,6 +104,29 @@ let outcome = maybe_apply_staged_update_with("mytool", &options)?;
 `maybe_apply_staged_update_with` returns a [`StagedUpdateOutcome`] describing what happened;
 the plain `maybe_apply_staged_update` keeps its original signature and stays nonfatal.
 
+### The `<tool> update` path
+
+`run_update` / `promote_next` install without launching anything, so they cannot detect a
+broken binary the way the startup path does — the failure would surface at the *next*
+invocation. They therefore always **preserve the binary they replace** as `<tool>_prev`, and
+report it on `UpdateOutcome::preserved_previous_path`, so a bad update is recoverable rather
+than final. If the promotion cannot be completed after the replacement, the preserved binary
+is restored and the two failures are reported separately.
+
+Validation on this path is opt-in:
+
+```rust,ignore
+let mut config = UpdaterConfig::new("mytool", env!("CARGO_PKG_VERSION"), "owner/mytool");
+config.validate_before_promote = true; // launch the candidate before installing it
+```
+
+It is off by default because it changes when an update is *refused*, and a validation that is
+wrong in the strict direction silently pins a host to its old version. With it off,
+`promoted: true` asserts only that the file was moved into place — not that it runs.
+`stage_next`'s sha256 check proves the archive matches its published checksum, which is a
+different property from runnability: a build for the wrong libc, a truncated inner binary, or
+a broken build published with a correct checksum all verify and then fail to run.
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/):
