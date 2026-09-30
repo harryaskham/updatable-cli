@@ -12,6 +12,25 @@ and will move under the first released version when `0.1.0` is cut.
 
 ### Added
 
+- **Transactional startup promotion** (bd-c7ac99): `maybe_apply_staged_update` no longer
+  renames a staged candidate over the running executable and hopes. It now validates the
+  candidate by launching it once (default `--version`, bounded by `validation_timeout`),
+  preserves the running executable as `<tool>_prev` with its sha256 recorded, promotes, and
+  — if the promoted binary fails to start — restores the preserved executable and re-hashes
+  it to prove the original bytes are back. Previously a failed re-exec only printed a warning
+  and left the host with a broken binary and no way back.
+  - Each failure is reported as its own variant of the new `StagedUpdateOutcome`, so a failed
+    update is never conflated with a failed recovery from it; `RollbackFailed` names the
+    preserved path for manual recovery.
+  - If the prior executable cannot be hashed or preserved, the promotion is refused rather
+    than performed unrecoverably.
+  - New `StagedUpdateOptions` plus `maybe_apply_staged_update_with` expose the validation
+    policy. Validation accepts a non-zero exit by default: not every CLI implements
+    `--version`, and rejecting on exit code would silently pin such hosts to their old
+    version. `require_validation_success` opts into the stricter check.
+  - Hermetic success/rejection/rollback/rollback-failure tests cover the transaction with an
+    injected launcher, so the rollback path is exercised without replacing the test process.
+
 - Core `Updater` flow over GitHub releases: `current_status`, `check_latest`,
   `stage_next` (downloads + sha256-verifies the release tarball), `promote_next`
   (atomic rename of the staged binary), and the high-level `run_update`.

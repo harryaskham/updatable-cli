@@ -57,10 +57,52 @@ register_update_tool(&mut router, |_ctx: &Ctx| {
 });
 ```
 
-Call `maybe_apply_staged_update("mytool")` early in `main`. Unix hosts swap any staged
-`<tool>_next` into place and re-exec before the rest of the program runs. Windows hosts
-leave `mytool_next.exe` staged because the running `mytool.exe` may be locked; the hook is
-nonfatal and prints the exact follow-up needed instead of risking corruption.
+Call `maybe_apply_staged_update("mytool")` early in `main`. Unix hosts validate the staged
+candidate, preserve the running executable as `<tool>_prev`, swap `<tool>_next` into place,
+and re-exec before the rest of the program runs — restoring the preserved executable if the
+new one fails to start (see [Promotion is transactional](#promotion-is-transactional)).
+Windows hosts leave `mytool_next.exe` staged because the running `mytool.exe` may be locked;
+the hook is nonfatal and prints the exact follow-up needed instead of risking corruption.
+
+## Promotion is transactional
+
+Replacing the running executable destroys the only known-good binary on the machine, so the
+startup hook treats promotion as a transaction rather than a rename:
+
+1. **Validate the candidate.** It is launched once (default `--version`, bounded by a
+   timeout) to establish that it is a runnable program. A candidate that cannot be spawned,
+   crashes on a signal, or hangs is refused *before* anything is replaced.
+2. **Preserve the prior identity.** The current executable is copied to `<tool>_prev` and its
+   sha256 recorded. If it cannot be preserved, the promotion is refused outright — trading a
+   working binary for one that cannot be undone is the failure this exists to prevent.
+3. **Promote, then launch.** If the promoted binary fails to start, `<tool>_prev` is restored
+   and re-hashed to prove the restored bytes are the original ones.
+4. **Report each failure distinctly.** "The new binary would not start" and "the new binary
+   would not start AND the old one could not be put back" are different operational
+   situations; the second is never reported as the first, and it names the preserved path for
+   manual recovery.
+
+By default validation accepts a candidate that exits non-zero. Not every CLI implements
+`--version`, and one that does not typically exits with a usage error — rejecting on exit code
+by default would refuse good binaries and silently pin the host to its old version, which is
+exactly the quiet failure mode this crate exists to avoid. Hosts that know their tool
+implements the validation arguments can tighten it:
+
+```rust,ignore
+use std::time::Duration;
+use updatable_cli::{StagedUpdateOptions, maybe_apply_staged_update_with};
+
+let options = StagedUpdateOptions {
+    require_validation_success: true,
+    validation_args: vec!["--version".to_string()],
+    validation_timeout: Duration::from_secs(5),
+    ..StagedUpdateOptions::default()
+};
+let outcome = maybe_apply_staged_update_with("mytool", &options)?;
+```
+
+`maybe_apply_staged_update_with` returns a [`StagedUpdateOutcome`] describing what happened;
+the plain `maybe_apply_staged_update` keeps its original signature and stays nonfatal.
 
 ## Examples
 

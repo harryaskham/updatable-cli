@@ -1525,6 +1525,286 @@ fn staged_executable_file_name(tool_name: &str) -> String {
     }
 }
 
+/// Name of the preserved prior executable: `<tool>_prev` (`.exe` on Windows).
+///
+/// A promotion that replaces the running executable destroys the only known-good binary on
+/// the machine. Keeping the prior identity under a predictable sibling name is what makes a
+/// failed promotion recoverable, both automatically and by hand.
+fn previous_executable_file_name(tool_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool_name}_prev.exe")
+    } else {
+        format!("{tool_name}_prev")
+    }
+}
+
+/// How a staged candidate is checked before it is allowed to replace the running executable.
+#[derive(Debug, Clone)]
+pub struct StagedUpdateOptions {
+    /// Launch the candidate once before promoting it. Defaults to `true`.
+    pub validate_candidate: bool,
+    /// Arguments for the validation launch. Defaults to `["--version"]`.
+    pub validation_args: Vec<String>,
+    /// Maximum time the validation launch may take before it is killed and rejected.
+    /// Defaults to 10 seconds.
+    pub validation_timeout: Duration,
+    /// Require the validation launch to exit successfully. Defaults to `false`.
+    ///
+    /// Off by default on purpose. Not every CLI implements `--version`, and one that does not
+    /// typically exits non-zero with a usage error. Rejecting on exit code by default would
+    /// therefore refuse perfectly good binaries and leave the host silently pinned to its old
+    /// version — trading a loud failure for exactly the kind of quiet one this crate exists to
+    /// avoid. The default therefore rejects only candidates that cannot run at all: a failed
+    /// spawn, a crash by signal, or a hang. Hosts that know their tool implements the
+    /// validation arguments should turn this on for a stricter check.
+    pub require_validation_success: bool,
+}
+
+impl Default for StagedUpdateOptions {
+    fn default() -> Self {
+        Self {
+            validate_candidate: true,
+            validation_args: vec!["--version".to_string()],
+            validation_timeout: Duration::from_secs(10),
+            require_validation_success: false,
+        }
+    }
+}
+
+/// What the startup promotion transaction did.
+///
+/// Every failure mode is a distinct variant so that an original failure is never conflated
+/// with a failure to recover from it: "the new binary would not start" and "the new binary
+/// would not start AND the old one could not be put back" are very different operational
+/// situations, and the second must never be reported as the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedUpdateOutcome {
+    /// No staged candidate was present; nothing was touched.
+    NothingStaged,
+    /// Promotion is deferred to a host installer (Windows locks running images).
+    Deferred {
+        /// Actionable guidance for completing the replacement out of process.
+        note: String,
+    },
+    /// The candidate was refused before promotion. The prior executable is untouched.
+    CandidateRejected {
+        /// Why the candidate was refused.
+        reason: String,
+    },
+    /// The candidate was promoted and the prior executable is preserved at this path.
+    Promoted {
+        /// Path of the preserved prior executable.
+        previous_backup: PathBuf,
+    },
+    /// The promoted candidate failed to start and the prior executable was restored.
+    RolledBack {
+        /// Why the promoted candidate failed to start.
+        launch_error: String,
+        /// Path that now holds the restored prior executable.
+        restored: PathBuf,
+    },
+    /// The promoted candidate failed to start AND the prior executable could not be restored.
+    RollbackFailed {
+        /// Why the promoted candidate failed to start.
+        launch_error: String,
+        /// Why restoring the prior executable failed — reported separately, never merged
+        /// into `launch_error`.
+        restore_error: String,
+        /// Path where the prior executable was preserved, for manual recovery.
+        backup: PathBuf,
+    },
+}
+
+/// Launch `candidate` once to establish that it is a runnable program.
+fn validate_candidate_launch(candidate: &Path, options: &StagedUpdateOptions) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(candidate)
+        .args(&options.validation_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("candidate {} could not be launched", candidate.display()))?;
+    let deadline = std::time::Instant::now() + options.validation_timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(signal) = status.signal() {
+                        bail!(
+                            "candidate {} was terminated by signal {signal}",
+                            candidate.display()
+                        );
+                    }
+                }
+                if !status.success() && options.require_validation_success {
+                    bail!("candidate {} exited with {status}", candidate.display());
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "candidate {} did not exit within {:?}",
+                        candidate.display(),
+                        options.validation_timeout
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => bail!(
+                "waiting on candidate {} failed: {error}",
+                candidate.display()
+            ),
+        }
+    }
+}
+
+/// Put the preserved prior executable back and prove it is byte-identical to what was there
+/// before the promotion.
+fn restore_previous_executable(backup: &Path, current: &Path, expected_digest: &str) -> Result<()> {
+    fs::copy(backup, current)
+        .with_context(|| format!("restore {} from {}", current.display(), backup.display()))?;
+    set_executable(current)
+        .with_context(|| format!("restore executable bit on {}", current.display()))?;
+    let digest =
+        sha256_file(current).with_context(|| format!("re-hash restored {}", current.display()))?;
+    if digest != expected_digest {
+        bail!(
+            "restored {} does not match the prior executable (sha256 {digest} != {expected_digest}); \
+             the preserved copy is still at {}",
+            current.display(),
+            backup.display()
+        );
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+/// The shared promotion transaction: validate, preserve, promote, and restore on a failed
+/// launch.
+///
+/// `launch` is only expected to return when starting the promoted binary FAILED — a
+/// successful `exec` replaces the process image and never comes back. It is injected so the
+/// whole transaction, including the rollback path, is testable without replacing the test
+/// process.
+#[cfg_attr(windows, allow(dead_code))]
+fn run_staged_update_transaction(
+    current: &Path,
+    staged: &Path,
+    backup: &Path,
+    options: &StagedUpdateOptions,
+    validate: &dyn Fn(&Path, &StagedUpdateOptions) -> Result<()>,
+    launch: &dyn Fn(&Path) -> std::io::Error,
+) -> StagedUpdateOutcome {
+    if let Err(error) = set_executable(staged) {
+        return StagedUpdateOutcome::CandidateRejected {
+            reason: format!(
+                "staged candidate {} is not promotable: chmod 0755 failed: {error}",
+                staged.display()
+            ),
+        };
+    }
+    if options.validate_candidate {
+        if let Err(error) = validate(staged, options) {
+            return StagedUpdateOutcome::CandidateRejected {
+                reason: format!("staged candidate failed validation: {error:#}"),
+            };
+        }
+    }
+
+    // Preserve the prior identity BEFORE anything replaces it. If it cannot be preserved the
+    // promotion is refused outright: proceeding would trade a working binary for one that
+    // cannot be undone, which is the failure this transaction exists to prevent.
+    let prior_digest = match sha256_file(current) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return StagedUpdateOutcome::CandidateRejected {
+                reason: format!(
+                    "refusing to promote: could not hash the current executable {}: {error:#}",
+                    current.display()
+                ),
+            };
+        }
+    };
+    if let Err(error) = fs::copy(current, backup) {
+        return StagedUpdateOutcome::CandidateRejected {
+            reason: format!(
+                "refusing to promote: could not preserve the current executable {} at {}: {error}",
+                current.display(),
+                backup.display()
+            ),
+        };
+    }
+
+    if let Err(error) = fs::rename(staged, current) {
+        // Nothing was replaced, so the preserved copy is noise rather than a recovery point.
+        let _ = fs::remove_file(backup);
+        return StagedUpdateOutcome::CandidateRejected {
+            reason: format!(
+                "failed to promote staged update {}: {error}",
+                staged.display()
+            ),
+        };
+    }
+    // Historically warn-only, and deliberately still non-fatal: the binary is already in
+    // place, and the launch below is the real test of whether it works.
+    let _ = set_executable(current);
+
+    let launch_error = launch(current);
+    match restore_previous_executable(backup, current, &prior_digest) {
+        Ok(()) => StagedUpdateOutcome::RolledBack {
+            launch_error: launch_error.to_string(),
+            restored: current.to_path_buf(),
+        },
+        Err(restore_error) => StagedUpdateOutcome::RollbackFailed {
+            launch_error: launch_error.to_string(),
+            restore_error: format!("{restore_error:#}"),
+            backup: backup.to_path_buf(),
+        },
+    }
+}
+
+/// Print a startup-promotion outcome, keeping each failure distinct.
+fn report_staged_update_outcome(tool_name: &str, outcome: &StagedUpdateOutcome) {
+    match outcome {
+        StagedUpdateOutcome::NothingStaged | StagedUpdateOutcome::Promoted { .. } => {}
+        StagedUpdateOutcome::Deferred { note } => eprintln!("warning: {note}"),
+        StagedUpdateOutcome::CandidateRejected { reason } => {
+            eprintln!(
+                "warning: staged {tool_name} update was not applied: {reason}; \
+                 continuing with the current executable"
+            );
+        }
+        StagedUpdateOutcome::RolledBack {
+            launch_error,
+            restored,
+        } => {
+            eprintln!(
+                "warning: promoted {tool_name} update failed to start: {launch_error}; \
+                 restored the previous executable at {}",
+                restored.display()
+            );
+        }
+        StagedUpdateOutcome::RollbackFailed {
+            launch_error,
+            restore_error,
+            backup,
+        } => {
+            eprintln!("error: promoted {tool_name} update failed to start: {launch_error}");
+            eprintln!(
+                "error: restoring the previous {tool_name} executable ALSO failed: {restore_error}; \
+                 the previous executable is preserved at {} — restore it manually",
+                backup.display()
+            );
+        }
+    }
+}
+
 fn windows_deferred_promotion_note(next: &Path, installed: &Path) -> String {
     format!(
         "update staged at {}; Windows cannot safely replace an existing/running executable; \
@@ -1536,67 +1816,76 @@ fn windows_deferred_promotion_note(next: &Path, installed: &Path) -> String {
 
 /// Look up the running binary and apply any staged sibling update.
 ///
-/// Unix hosts promote `<tool>_next` and re-exec. Windows hosts detect
+/// Unix hosts validate `<tool>_next`, preserve the running executable as `<tool>_prev`,
+/// promote, and re-exec. If the promoted binary fails to start, the preserved executable is
+/// restored automatically and both failures are reported separately. Windows hosts detect
 /// `<tool>_next.exe` but leave it staged, print actionable replacement guidance, and continue:
 /// a running `.exe` may be locked and must never be corrupted by an unsafe in-process swap.
 /// The function is intentionally best-effort on every platform: failures only print warnings
 /// and return `Ok(())` so the rest of the CLI still starts.
+///
+/// Use [`maybe_apply_staged_update_with`] to change the candidate-validation policy.
 pub fn maybe_apply_staged_update(tool_name: &str) -> Result<()> {
+    maybe_apply_staged_update_with(tool_name, &StagedUpdateOptions::default()).map(|_| ())
+}
+
+/// [`maybe_apply_staged_update`] with an explicit candidate-validation policy.
+///
+/// Returns the transaction outcome so a host can log or act on it; the startup path itself
+/// stays non-fatal and already prints each failure distinctly.
+pub fn maybe_apply_staged_update_with(
+    tool_name: &str,
+    options: &StagedUpdateOptions,
+) -> Result<StagedUpdateOutcome> {
     let current = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("warning: {tool_name} could not resolve current_exe: {error}");
-            return Ok(());
+            return Ok(StagedUpdateOutcome::NothingStaged);
         }
     };
     let staged = current.with_file_name(staged_executable_file_name(tool_name));
     if !staged.exists() {
-        return Ok(());
+        return Ok(StagedUpdateOutcome::NothingStaged);
     }
     #[cfg(windows)]
     {
-        eprintln!(
-            "warning: {}",
-            windows_deferred_promotion_note(&staged, &current)
-        );
-        return Ok(());
+        let outcome = StagedUpdateOutcome::Deferred {
+            note: windows_deferred_promotion_note(&staged, &current),
+        };
+        report_staged_update_outcome(tool_name, &outcome);
+        return Ok(outcome);
     }
     #[cfg(unix)]
     {
-        if let Err(error) = set_executable(&staged) {
-            eprintln!(
-                "warning: staged {tool_name} update {} is not promotable: chmod 0755 failed: {error}",
-                staged.display()
-            );
-            return Ok(());
-        }
-        if let Err(error) = fs::rename(&staged, &current) {
-            eprintln!(
-                "warning: failed to promote staged {tool_name} update {}: {error}",
-                staged.display()
-            );
-            return Ok(());
-        }
-        if let Err(error) = set_executable(&current) {
-            eprintln!(
-                "warning: promoted {tool_name} update {} may not be executable: chmod 0755 failed: {error}",
-                current.display()
-            );
-        }
-        eprintln!("Applied staged {tool_name} update");
-        let exe = current.into_os_string();
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let err = exec_replace(&exe, &args);
-        eprintln!("warning: failed to re-exec after staged {tool_name} update: {err}");
-        Ok(())
+        let backup = current.with_file_name(previous_executable_file_name(tool_name));
+        let outcome = run_staged_update_transaction(
+            &current,
+            &staged,
+            &backup,
+            options,
+            &validate_candidate_launch,
+            &|promoted| {
+                eprintln!("Applied staged {tool_name} update");
+                let exe = promoted.as_os_str().to_os_string();
+                let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                // Only returns if the exec FAILED; success replaces this process image.
+                exec_replace(&exe, &args)
+            },
+        );
+        report_staged_update_outcome(tool_name, &outcome);
+        Ok(outcome)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        eprintln!(
-            "warning: staged {tool_name} update {} cannot be promoted on this platform",
-            staged.display()
-        );
-        Ok(())
+        let outcome = StagedUpdateOutcome::CandidateRejected {
+            reason: format!(
+                "staged update {} cannot be promoted on this platform",
+                staged.display()
+            ),
+        };
+        report_staged_update_outcome(tool_name, &outcome);
+        Ok(outcome)
     }
 }
 
@@ -3308,6 +3597,236 @@ mod tests {
         }
     }
 
+    /// Lay down a fake install: a "current" executable and a staged candidate, plus the
+    /// backup path the transaction should use. Deliberately cross-platform — the transaction
+    /// is file movement plus injected validate/launch, so gating these behind `cfg(unix)`
+    /// would leave the rollback contract unexercised on a lane that could run it (bd-ab07b8
+    /// is the precedent: a portable contract hidden behind a platform gate went unchecked).
+    fn staged_update_fixture(
+        payload_current: &[u8],
+        payload_staged: &[u8],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let current = tmp.path().join(executable_file_name("toolx"));
+        let staged = tmp.path().join(staged_executable_file_name("toolx"));
+        let backup = tmp.path().join(previous_executable_file_name("toolx"));
+        fs::write(&current, payload_current).unwrap();
+        fs::write(&staged, payload_staged).unwrap();
+        (tmp, current, staged, backup)
+    }
+
+    fn accept_candidate(_: &Path, _: &StagedUpdateOptions) -> Result<()> {
+        Ok(())
+    }
+
+    /// The heart of bd-c7ac99: a promoted binary that will not start must not leave the host
+    /// without a working executable.
+    #[test]
+    fn staged_update_transaction_restores_prior_executable_when_launch_fails() {
+        let (_tmp, current, staged, backup) =
+            staged_update_fixture(b"known good\n", b"broken candidate\n");
+        let observed: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+        let outcome = run_staged_update_transaction(
+            &current,
+            &staged,
+            &backup,
+            &StagedUpdateOptions {
+                validate_candidate: false,
+                ..StagedUpdateOptions::default()
+            },
+            &accept_candidate,
+            &|promoted| {
+                // Prove the candidate really was in place when the launch was attempted, so
+                // this is a genuine rollback and not a promotion that never happened.
+                observed.lock().unwrap().push(fs::read(promoted).unwrap());
+                std::io::Error::other("Exec format error")
+            },
+        );
+        match outcome {
+            StagedUpdateOutcome::RolledBack {
+                launch_error,
+                restored,
+            } => {
+                assert!(
+                    launch_error.contains("Exec format error"),
+                    "the original launch failure must be reported verbatim: {launch_error}"
+                );
+                assert_eq!(restored, current);
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[b"broken candidate\n".to_vec()],
+            "the candidate must actually be promoted before the launch is attempted"
+        );
+        assert_eq!(
+            fs::read(&current).unwrap(),
+            b"known good\n",
+            "a failed launch must leave the PRIOR binary in place"
+        );
+        assert!(
+            !backup.exists(),
+            "a successful restore consumes the backup rather than leaving litter"
+        );
+    }
+
+    /// A rejected candidate must never disturb the working executable, and must not leave a
+    /// stray backup implying a promotion happened.
+    #[test]
+    fn staged_update_transaction_rejects_invalid_candidate_without_touching_current() {
+        let (_tmp, current, staged, backup) = staged_update_fixture(b"known good\n", b"cand\n");
+        let outcome = run_staged_update_transaction(
+            &current,
+            &staged,
+            &backup,
+            &StagedUpdateOptions::default(),
+            &|_, _| bail!("candidate could not be launched"),
+            &|_| panic!("launch must never be reached for a rejected candidate"),
+        );
+        match outcome {
+            StagedUpdateOutcome::CandidateRejected { reason } => {
+                assert!(reason.contains("could not be launched"), "got: {reason}");
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert_eq!(fs::read(&current).unwrap(), b"known good\n");
+        assert!(
+            staged.exists(),
+            "a rejected candidate is left for inspection"
+        );
+        assert!(
+            !backup.exists(),
+            "nothing was replaced, so there is nothing to preserve"
+        );
+    }
+
+    /// The worst case must be reported as its own thing: the update failed AND the recovery
+    /// failed. Conflating them would tell an operator their old binary is back when it is not.
+    #[test]
+    fn staged_update_transaction_reports_launch_and_restore_failures_separately() {
+        let (_tmp, current, staged, backup) =
+            staged_update_fixture(b"known good\n", b"broken candidate\n");
+        let backup_for_launch = backup.clone();
+        let outcome = run_staged_update_transaction(
+            &current,
+            &staged,
+            &backup,
+            &StagedUpdateOptions {
+                validate_candidate: false,
+                ..StagedUpdateOptions::default()
+            },
+            &accept_candidate,
+            &|_| {
+                // Destroy the recovery point between promotion and restore.
+                fs::remove_file(&backup_for_launch).unwrap();
+                std::io::Error::other("Exec format error")
+            },
+        );
+        match outcome {
+            StagedUpdateOutcome::RollbackFailed {
+                launch_error,
+                restore_error,
+                backup: reported,
+            } => {
+                assert!(launch_error.contains("Exec format error"));
+                assert!(
+                    !restore_error.contains("Exec format error"),
+                    "the restore failure must be its own message, not an echo of the launch \
+                     failure: {restore_error}"
+                );
+                assert_eq!(reported, backup);
+            }
+            other => panic!("expected a distinct rollback failure, got {other:?}"),
+        }
+    }
+
+    /// A restore that produces different bytes than were there before is a FAILED restore,
+    /// even though every individual file operation succeeded.
+    #[test]
+    fn restore_rejects_a_backup_that_does_not_match_the_prior_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current = tmp.path().join("toolx");
+        let backup = tmp.path().join("toolx_prev");
+        fs::write(&current, b"replaced\n").unwrap();
+        fs::write(&backup, b"not the original\n").unwrap();
+        let error = restore_previous_executable(&backup, &current, &"0".repeat(64)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match the prior executable"),
+            "got: {message}"
+        );
+        assert!(
+            backup.exists(),
+            "a failed restore must keep the preserved copy for manual recovery"
+        );
+    }
+
+    /// Default policy accepts a runnable program that does not implement `--version`, because
+    /// rejecting on exit code would silently pin such hosts to their old version forever.
+    #[cfg(unix)]
+    #[test]
+    fn candidate_validation_accepts_a_runnable_binary_and_rejects_an_unrunnable_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = tmp.path().join("ok");
+        fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
+        set_executable(&ok).unwrap();
+        let nonzero = tmp.path().join("nonzero");
+        fs::write(&nonzero, "#!/bin/sh\nexit 3\n").unwrap();
+        set_executable(&nonzero).unwrap();
+        let garbage = tmp.path().join("garbage");
+        fs::write(&garbage, b"\x7fnot-an-executable").unwrap();
+        set_executable(&garbage).unwrap();
+
+        let lenient = StagedUpdateOptions::default();
+        validate_candidate_launch(&ok, &lenient).expect("a clean exit validates");
+        validate_candidate_launch(&nonzero, &lenient)
+            .expect("a non-zero exit is not proof the binary is broken");
+        let error = validate_candidate_launch(&garbage, &lenient)
+            .expect_err("a file that cannot be executed at all must be rejected");
+        assert!(format!("{error:#}").contains("could not be launched"));
+
+        let strict = StagedUpdateOptions {
+            require_validation_success: true,
+            ..StagedUpdateOptions::default()
+        };
+        validate_candidate_launch(&ok, &strict).expect("a clean exit still validates");
+        let strict_error = validate_candidate_launch(&nonzero, &strict)
+            .expect_err("strict hosts reject a non-zero exit");
+        assert!(format!("{strict_error:#}").contains("exited with"));
+    }
+
+    /// A candidate that hangs must not hang the host's startup.
+    #[cfg(unix)]
+    #[test]
+    fn candidate_validation_kills_and_rejects_a_hanging_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hang = tmp.path().join("hang");
+        fs::write(&hang, "#!/bin/sh\nsleep 30\n").unwrap();
+        set_executable(&hang).unwrap();
+        let options = StagedUpdateOptions {
+            validation_timeout: Duration::from_millis(200),
+            ..StagedUpdateOptions::default()
+        };
+        let started = std::time::Instant::now();
+        let error = validate_candidate_launch(&hang, &options).expect_err("a hang is a failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "validation must be bounded"
+        );
+        assert!(format!("{error:#}").contains("did not exit within"));
+    }
+
+    #[test]
+    fn previous_executable_file_name_is_a_platform_native_sibling() {
+        let name = previous_executable_file_name("toolx");
+        if cfg!(windows) {
+            assert_eq!(name, "toolx_prev.exe");
+        } else {
+            assert_eq!(name, "toolx_prev");
+        }
+    }
+
     #[test]
     fn maybe_apply_staged_update_is_a_clean_noop_when_nothing_is_staged() {
         // In the test binary, current_exe() is the test runner and there is no
@@ -3319,6 +3838,14 @@ mod tests {
         assert!(
             result.is_ok(),
             "no-op startup hook should not error: {result:?}"
+        );
+        assert_eq!(
+            maybe_apply_staged_update_with(
+                "updatable_cli_unlikely_tool_name_xyz",
+                &StagedUpdateOptions::default()
+            )
+            .unwrap(),
+            StagedUpdateOutcome::NothingStaged
         );
     }
 
